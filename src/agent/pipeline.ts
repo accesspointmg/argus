@@ -31,6 +31,7 @@ import { CommentHandler } from './comment-handler';
 import { EditDetector } from './edit-detector';
 import { PRAnalyzer } from './pr-analyzer';
 import { LoopDetector, ChainAnalysis } from './loop-detector';
+import { EngagementPolicy, EngagementDecision } from './engagement';
 import type { StampManager } from '../crypto/stamp';
 import type { AuditLog } from '../crypto/audit';
 import type { Logger } from '../util/logger';
@@ -42,6 +43,11 @@ export interface PipelineConfig {
     prPrefix: string;              // e.g., "argus/"
     branchPrefix: string;
     dryRun: boolean;
+    /**
+     * Comments Argus may post on one issue thread before going quiet.
+     * Mirrors MAX_ACKS_PER_PR, which bounds the PR side.
+     */
+    maxCommentsPerThread: number;
 }
 
 const DEFAULT_CONFIG: PipelineConfig = {
@@ -51,6 +57,7 @@ const DEFAULT_CONFIG: PipelineConfig = {
     prPrefix: '',
     branchPrefix: 'argus/',
     dryRun: false,
+    maxCommentsPerThread: 3,
 };
 
 // ─── Bot Detection ──────────────────────────────────────────────
@@ -125,6 +132,9 @@ export class Pipeline {
     /** Chain-tracing loop detector shared across poll cycles. */
     private loopDetector: LoopDetector;
 
+    /** Decides whether a thread still warrants a comment from us. */
+    private engagementPolicy: EngagementPolicy;
+
     constructor(
         private readonly evaluator: Evaluator,
         private readonly investigator: Investigator,
@@ -140,6 +150,9 @@ export class Pipeline {
     ) {
         this.config = { ...DEFAULT_CONFIG, ...config };
         this.loopDetector = new LoopDetector(stampManager, logger);
+        this.engagementPolicy = new EngagementPolicy(stampManager, logger, {
+            maxComments: this.config.maxCommentsPerThread,
+        });
     }
 
     // ─── Public API ─────────────────────────────────────────────────
@@ -160,9 +173,11 @@ export class Pipeline {
                 continue;
             }
 
-            // Skip if Argus has the last word (no new comments since our last stamp)
-            if (await this.argusHasLastWord(forge, issue.number)) {
-                this.logger.info(`Skipping issue #${issue.number} — Argus has the last word`);
+            // Decide whether there is anything new worth saying, and whether we
+            // have already said enough on this thread.
+            const engagement = await this.shouldEngage(forge, issue.number);
+            if (!engagement.engage) {
+                this.logger.info(`Skipping issue #${issue.number} — ${engagement.reason}`);
                 continue;
             }
 
@@ -500,29 +515,29 @@ ${lastIteration?.ciResult === 'passing' ? '✅ Passing' : '⚠️ Not passing �
     // ─── Issue Comment Management ───────────────────────────────────
 
     /**
-     * Check if Argus has the "last word" on an issue.
-     * Returns true if the most recent comment has an Argus stamp — meaning
-     * nobody has replied since we last responded, so there's nothing new to do.
-     * Returns false if:
-     *  - There are no comments at all (new issue)
-     *  - The most recent comment is NOT from Argus (someone replied — re-engage)
-     *  - We can't read comments (fail open — process the issue)
+     * Decide whether to engage with a thread.
+     *
+     * Delegates to {@link EngagementPolicy}, which bounds how much Argus says
+     * per thread and refuses to trade comments with other agents. This replaced
+     * an earlier "does Argus have the last word?" check: that re-engaged
+     * whenever anybody else commented last, so two agents applying the same
+     * rule alternated indefinitely.
+     *
+     * Fails open — if comments cannot be read we treat the thread as fresh,
+     * since going silent on a transient API error looks like Argus is dead.
      */
-    private async argusHasLastWord(forge: Forge, issueNumber: number): Promise<boolean> {
+    private async shouldEngage(forge: Forge, issueNumber: number): Promise<EngagementDecision> {
         try {
             const comments = await forge.getIssueComments(issueNumber);
-            if (comments.length === 0) { return false; }
-
-            // Sort by creation date descending to find the most recent
-            const sorted = [...comments].sort(
-                (a, b) => b.createdAt.getTime() - a.createdAt.getTime(),
-            );
-            const latest = sorted[0];
-
-            return this.stampManager.hasStamp(latest.body);
+            return this.engagementPolicy.decide(comments);
         } catch (err) {
-            this.logger.debug(`Could not check last word for issue #${issueNumber}: ${err}`);
-            return false; // Fail open — process the issue if we can't check
+            this.logger.debug(`Could not read comments for issue #${issueNumber}: ${err}`);
+            return {
+                engage: true,
+                reason: 'Could not read comments — treating as a fresh thread',
+                ourComments: 0,
+                budget: 0,
+            };
         }
     }
 
