@@ -1,17 +1,21 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Threat classifier — LLM-based threat assessment with isolated system prompt.
  * Uses a SEPARATE LLM call with random boundary tokens for each classification.
  */
 
-import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import type { ThreatAssessment, ThreatClassification, SanitizationResult } from './types';
 import type { Logger } from '../util/logger';
+import type { LlmService } from '../llm';
+import { user } from '../llm';
 
 export class ThreatClassifier {
-    constructor(private readonly logger: Logger) {}
+    constructor(
+        private readonly logger: Logger,
+        private readonly llm: LlmService,
+    ) {}
 
     /**
      * Classify untrusted input for threat level.
@@ -114,25 +118,13 @@ ${sanitized.strippedPatterns.length > 0
 
 Respond with the JSON classification.`;
 
-        // Use Copilot LM API
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        if (models.length === 0) {
-            throw new Error('No Copilot language model available');
-        }
-        const model = models[0];
-
-        const messages = [
-            vscode.LanguageModelChatMessage.User(systemPrompt),
-            vscode.LanguageModelChatMessage.User(userPrompt),
-        ];
-
-        const response = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-
-        // Collect response
-        let responseText = '';
-        for await (const chunk of response.text) {
-            responseText += chunk;
-        }
+        // The system prompt goes in the provider's system channel where one
+        // exists, keeping our instructions out of the same channel as the
+        // untrusted text we are asking about.
+        const responseText = await this.llm.chat({
+            system: systemPrompt,
+            messages: [user(userPrompt)],
+        });
 
         // Verify canary
         if (!responseText.includes(canary)) {

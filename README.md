@@ -6,7 +6,7 @@ A VS Code extension that autonomously triages GitHub/GitLab issues, investigates
 
 ## Features
 
-- **Issue Triage** — Polls repos for new issues, evaluates technical merit using Copilot LM API
+- **Issue Triage** — Polls repos for new issues, evaluates technical merit with the AI provider of your choice
 - **Agentic Evaluation** — Multi-turn LLM exploration of the full codebase via READ_FILES protocol before rendering judgment
 - **Code Investigation** — Reads relevant source files, searches for error patterns, builds context
 - **Autonomous Coding** — Creates branches, iterates on fixes, monitors CI results
@@ -28,8 +28,45 @@ A VS Code extension that autonomously triages GitHub/GitLab issues, investigates
 
 1. Install the extension
 2. Open the command palette and run **Argus: Set GitHub Token** (or GitLab)
-3. Add repos via **Argus: Add Repository** or configure `argus.repos` in settings
-4. Click **Start** in the Argus sidebar panel
+3. Run **Argus: Select AI Provider** and pick the model Argus should think with
+4. Add repos via **Argus: Add Repository** or configure `argus.repos` in settings
+5. Click **Start** in the Argus sidebar panel
+
+### Choosing an AI Provider
+
+Argus needs a language model, but it does not care which one. **Argus: Select AI
+Provider** walks through the choice and stores any API key in VS Code's
+SecretStorage (keys are held per provider, so switching back and forth does not
+mean re-entering them).
+
+| Provider | Setting value | Needs a key | Notes |
+|---|---|---|---|
+| VS Code / GitHub Copilot | `vscode-lm` | No | The default. Uses any chat model VS Code already provides; set `argus.ai.vendor` to select a non-Copilot one. |
+| Anthropic Claude | `anthropic` | Yes | Adaptive thinking on, with an automatic fallback model when a safety classifier declines a security review. |
+| OpenAI | `openai` | Yes | |
+| Google Gemini | `gemini` | Yes | |
+| Ollama | `ollama` | No | Runs on your machine — nothing leaves the host. Worth considering for private repositories. |
+| Anything OpenAI-compatible | `openai-compatible` | Usually | Groq, Together, OpenRouter, vLLM, LM Studio, a corporate gateway. Point `argus.ai.baseUrl` at it. |
+
+The flow is **provider → endpoint → key → model → effort**, and that order
+matters: the model list is fetched live from the vendor, which can't happen
+before the key exists. You pick from what your key can actually reach — Ollama
+lists what you've pulled, Anthropic and Gemini show context windows — rather
+than typing a model name from memory and finding the typo as a 404 later. If a
+vendor is unreachable or a self-hosted server has no listing route, it falls
+back to a text box.
+
+`argus.ai.effort` controls how hard the model thinks (`low` … `max`). It's
+honored by the Anthropic provider; the others ignore it rather than guessing at
+an equivalent knob, since sending the wrong one is a 400. Leave it at `default`
+unless you have a reason — and note `xhigh`/`max` are rejected by older models.
+
+Two related settings that aren't per-model: `argus.ai.maxTokens` caps a single
+reply (needs headroom — code generation returns whole files), and
+`argus.rateLimits.llmCallsPerHour` bounds spend across all repositories.
+
+Adding a provider means one file under `src/llm/providers/` — nothing outside
+that folder knows which vendors exist.
 
 ### Required GitHub PAT Permissions (Fine-Grained)
 
@@ -38,7 +75,7 @@ A VS Code extension that autonomously triages GitHub/GitLab issues, investigates
 | Contents | Read & Write | Read code, create branches, commit files |
 | Issues | Read & Write | Read issues, add labels, post comments |
 | Pull requests | Read & Write | Create PRs, post review acknowledgments |
-| Commit statuses | Read | Monitor CI results |
+| Commit statuses | Read & Write | Monitor CI results, post threat assessment verdicts |
 
 ## Architecture
 
@@ -59,6 +96,11 @@ src/
 │   ├── comment-handler.ts # Comment moderation with threat assessment
 │   ├── edit-detector.ts  # Detects mid-flight issue edits
 │   └── pr-analyzer.ts    # Competitive PR analysis & synthesis
+├── llm/                  # Provider abstraction — one interface, any vendor
+│   ├── types.ts          # ChatRequest/ChatMessage, LlmProvider, errors
+│   ├── service.ts        # Resolves argus.ai.* settings into a live provider
+│   ├── setup.ts          # "Select AI Provider" / "Set AI Provider Key"
+│   └── providers/        # vscode-lm, anthropic, openai, gemini, ollama
 ├── security/             # Sanitization, threat classification, trust model
 ├── crypto/               # HMAC-SHA256 stamps, key management, audit log
 ├── notifications/        # Email system (SMTP)
@@ -81,4 +123,11 @@ Argus operates under a zero-trust model. All user-generated content (issues, com
 
 ## License
 
-Dual-licensed under Apache-2.0 and MIT. See [LICENSE_APACHE2.TXT](LICENSE_APACHE2.TXT) and [LICENSE_MIT.TXT](LICENSE_MIT.TXT).
+`SPDX-License-Identifier: Apache-2.0 OR MIT`
+
+Dual-licensed under [Apache-2.0](LICENSE_APACHE2.TXT) or [MIT](LICENSE_MIT.TXT),
+**at your option** — take the Apache-2.0 terms if you want its express patent
+grant, MIT if you want the shorter text. You don't need to tell anyone which you
+picked. See [LICENSE.txt](LICENSE.txt) for the full statement.
+
+Contributions are dual-licensed the same way unless you say otherwise.

@@ -1,4 +1,5 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
+
 
 /**
  * GitHub forge implementation using @octokit/rest.
@@ -372,6 +373,24 @@ export class GitHubForge implements Forge {
 
     // ─── CI ─────────────────────────────────────────────────────────
 
+    async createCommitStatus(
+        ref: string,
+        state: CommitStatus['state'],
+        context: string,
+        description: string,
+        targetUrl?: string,
+    ): Promise<void> {
+        await this.octokit.repos.createCommitStatus({
+            owner: this.owner,
+            repo: this.repo,
+            sha: ref,
+            state,
+            context,
+            description,
+            ...(targetUrl && { target_url: targetUrl }),
+        });
+    }
+
     async getCommitStatuses(ref: string): Promise<CommitStatus[]> {
         const { data } = await this.octokit.repos.getCombinedStatusForRef({
             owner: this.owner,
@@ -626,6 +645,7 @@ export class GitHubForge implements Forge {
             state,
             draft: !!data.draft,
             head: data.head?.ref || '',
+            headSha: data.head?.sha || '',
             base: data.base?.ref || '',
             url: data.html_url,
             apiUrl: data.url,

@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Trust resolver — graduated trust model based on repo roles and interaction history.
@@ -11,7 +11,7 @@
  *   participant → 0.30
  *   unknown     → 0.00
  *
- * A history modifier adjusts base trust by [-0.3, +0.2] based on past behaviour.
+ * A history modifier adjusts base trust by [-0.3, +0.2] based on past behavior.
  */
 
 import type { Forge, RepoRole, UserHistory } from '../forge/types';

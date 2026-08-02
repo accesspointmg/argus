@@ -1,9 +1,10 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 export { Sanitizer } from './sanitizer';
 export { ThreatClassifier } from './threat-classifier';
 export { TrustResolver } from './trust';
 export { OutputValidator, type ValidationResult, type ValidationIssue } from './validator';
+export { DiffAssessor } from './diff-assessor';
 export {
     INJECTION_PATTERNS,
     INVISIBLE_CHAR_PATTERNS,
@@ -19,6 +20,10 @@ export {
     type UserTrustProfile,
     type ThreatThresholds,
     type SanitizationResult,
+    type ExecutionSurfaceCategory,
+    type ExecutionSurfaceChange,
+    type DiffVerdict,
+    type DiffAssessment,
     type AuditEntry,
     type AuditAction,
     BASE_TRUST_SCORES,

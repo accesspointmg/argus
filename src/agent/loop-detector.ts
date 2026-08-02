@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * LoopDetector — traces chains of PRs to detect feedback loops.
@@ -41,7 +41,7 @@ export interface ChainNode {
 }
 
 export interface ChainAnalysis {
-    /** The PR being analysed. */
+    /** The PR being analyzed. */
     prNumber: number;
     /** Total chain length (root + follow-ups). */
     chainLength: number;

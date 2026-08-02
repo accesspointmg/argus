@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 export { EmailSender, type EmailConfig, type EmailMessage } from './email';
 export { NotificationRouter, type EventType } from './events';

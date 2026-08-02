@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Pipeline — the main orchestrator that drives Argus's issue processing.
@@ -30,6 +30,7 @@ import { Transcriber } from './transcriber';
 import { CommentHandler } from './comment-handler';
 import { EditDetector } from './edit-detector';
 import { PRAnalyzer } from './pr-analyzer';
+import { PRGatekeeper } from './pr-gatekeeper';
 import { LoopDetector, ChainAnalysis } from './loop-detector';
 import { EngagementPolicy, EngagementDecision } from './engagement';
 import type { StampManager } from '../crypto/stamp';
@@ -135,6 +136,9 @@ export class Pipeline {
     /** Decides whether a thread still warrants a comment from us. */
     private engagementPolicy: EngagementPolicy;
 
+    /** The gatekeeper — if provided, runs threat assessment on every open PR. */
+    private gatekeeper: PRGatekeeper | null = null;
+
     constructor(
         private readonly evaluator: Evaluator,
         private readonly investigator: Investigator,
@@ -153,6 +157,18 @@ export class Pipeline {
         this.engagementPolicy = new EngagementPolicy(stampManager, logger, {
             maxComments: this.config.maxCommentsPerThread,
         });
+    }
+
+    /**
+     * Attach a PRGatekeeper to the pipeline.
+     *
+     * When set, every `pollPRComments` cycle also runs threat assessment
+     * on every open PR and posts commit statuses. The gatekeeper shares
+     * the `listOpenPRs()` call with comment polling to avoid a redundant
+     * API round-trip.
+     */
+    setGatekeeper(gatekeeper: PRGatekeeper): void {
+        this.gatekeeper = gatekeeper;
     }
 
     // ─── Public API ─────────────────────────────────────────────────
@@ -812,6 +828,23 @@ ${sections.join('\n\n')}
         try {
             const openPRs = await forge.listOpenPRs();
             this.logger.debug(`Checking ${openPRs.length} open PR(s) in ${repoKey} for new comments`);
+
+            // ── Gatekeeper pass ──
+            // Runs threat assessment on every open PR before comment polling.
+            // Shares the openPRs list so we don't call listOpenPRs() twice.
+            if (this.gatekeeper) {
+                try {
+                    const gated = await this.gatekeeper.assessAll(forge, openPRs);
+                    if (gated > 0) {
+                        this.addActivity(
+                            repoKey, undefined, undefined,
+                            '🛡️', `Gatekeeper assessed ${gated} PR(s) in ${repoKey}`,
+                        );
+                    }
+                } catch (err) {
+                    this.logger.error(`Gatekeeper error for ${repoKey}: ${err}`);
+                }
+            }
 
             for (const pr of openPRs) {
                 try {

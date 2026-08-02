@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * extension.ts — Argus VS Code extension entry point.
@@ -32,10 +32,14 @@ import { NonceRegistry } from './crypto/nonce-registry';
 import { AuditLog } from './crypto/audit';
 
 // ── Security ────────────────────────────────────────────────────────
+import { LlmService } from './llm';
+import { selectAiProvider, promptAndStoreApiKey } from './llm/setup';
+
 import { Sanitizer } from './security/sanitizer';
 import { ThreatClassifier } from './security/threat-classifier';
 import { TrustResolver } from './security/trust';
 import { OutputValidator } from './security/validator';
+import { DiffAssessor } from './security/diff-assessor';
 
 // ── Agent ───────────────────────────────────────────────────────────
 import { Evaluator } from './agent/evaluator';
@@ -45,6 +49,7 @@ import { Transcriber } from './agent/transcriber';
 import { CommentHandler } from './agent/comment-handler';
 import { EditDetector } from './agent/edit-detector';
 import { PRAnalyzer } from './agent/pr-analyzer';
+import { PRGatekeeper } from './agent/pr-gatekeeper';
 import { Pipeline } from './agent/pipeline';
 
 // ── Notifications ───────────────────────────────────────────────────
@@ -101,20 +106,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const auditLog = new AuditLog(keyManager, context.globalState, auditOutputChannel);
     await auditLog.load();
 
+    // ── AI provider ──
+    // One service, injected everywhere a model is needed, so the choice of
+    // vendor is a setting rather than something baked into each agent.
+    const llm = new LlmService(context.secrets, logger);
+
     // ── Security subsystem ──
     const sanitizer = new Sanitizer();
-    const threatClassifier = new ThreatClassifier(logger);
+    const threatClassifier = new ThreatClassifier(logger, llm);
     const trustResolver = new TrustResolver();
     const outputValidator = new OutputValidator();
 
     // ── Agent subsystem ──
-    const evaluator = new Evaluator(logger, sanitizer);
-    const investigator = new Investigator(logger);
-    const coder = new Coder(logger, outputValidator, stampManager, auditLog);
+    const evaluator = new Evaluator(logger, sanitizer, llm);
+    const investigator = new Investigator(logger, llm);
+    const coder = new Coder(logger, outputValidator, stampManager, auditLog, llm);
     const transcriber = new Transcriber(logger, stampManager);
     const commentHandler = new CommentHandler(logger, sanitizer, threatClassifier, trustResolver, auditLog);
     const editDetector = new EditDetector(logger, auditLog);
-    const prAnalyzer = new PRAnalyzer(logger, trustResolver, stampManager);
+    const prAnalyzer = new PRAnalyzer(logger, trustResolver, stampManager, llm);
 
     pipeline = new Pipeline(
         evaluator,
@@ -129,6 +139,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         logger,
         toPipelineConfig(config),
     );
+
+    // ── Gatekeeper (merge gate via commit statuses) ──
+    const diffAssessor = new DiffAssessor(logger, sanitizer, llm);
+    const gatekeeper = new PRGatekeeper(
+        diffAssessor,
+        trustResolver,
+        stampManager,
+        auditLog,
+        logger,
+        { dryRun: config.dryRun },
+    );
+    pipeline.setGatekeeper(gatekeeper);
 
     // ── Email ──
     const emailSender = new EmailSender(config.email, logger);
@@ -220,6 +242,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
         vscode.commands.registerCommand('argus.configureRepos', () => {
             vscode.commands.executeCommand('workbench.action.openSettings', 'argus.repos');
+        }),
+
+        vscode.commands.registerCommand('argus.selectAiProvider', async () => {
+            await selectAiProvider(context.secrets);
+            logger.info(`AI provider is now ${await llm.describe()}.`);
+        }),
+
+        vscode.commands.registerCommand('argus.setAiKey', async () => {
+            await promptAndStoreApiKey(context.secrets);
         }),
 
         vscode.commands.registerCommand('argus.setGitHubToken', async () => {

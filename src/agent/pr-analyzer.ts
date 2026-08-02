@@ -1,22 +1,24 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * PR Analyzer — evaluates competing PRs, ranks them, and can synthesize a "super PR."
  */
 
-import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import type { Forge, PullRequest, FileChange } from '../forge/types';
 import type { PRAnalysis, SynthesisCandidate, TrackedIssue } from './types';
 import type { TrustResolver } from '../security/trust';
 import type { StampManager } from '../crypto/stamp';
 import type { Logger } from '../util/logger';
+import type { LlmService } from '../llm';
+import { user } from '../llm';
 
 export class PRAnalyzer {
     constructor(
         private readonly logger: Logger,
         private readonly trustResolver: TrustResolver,
         private readonly stampManager: StampManager,
+        private readonly llm: LlmService,
     ) {}
 
     /**
@@ -176,8 +178,7 @@ ${patches}
 
 Evaluate the technical quality.`;
 
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        if (models.length === 0) {
+        if (!(await this.llm.isAvailable())) {
             // Fallback: heuristic scoring
             return {
                 correctness: 0.5,
@@ -194,16 +195,10 @@ Evaluate the technical quality.`;
             };
         }
 
-        const messages = [
-            vscode.LanguageModelChatMessage.User(systemPrompt),
-            vscode.LanguageModelChatMessage.User(userPrompt),
-        ];
-
-        const response = await models[0].sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-        let responseText = '';
-        for await (const chunk of response.text) {
-            responseText += chunk;
-        }
+        const responseText = await this.llm.chat({
+            system: systemPrompt,
+            messages: [user(userPrompt)],
+        });
 
         if (!responseText.includes(canary)) {
             this.logger.warn('PR evaluation canary failed');

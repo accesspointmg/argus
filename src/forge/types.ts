@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Forge types — the multi-platform abstraction for GitHub and GitLab.
@@ -85,6 +85,7 @@ export interface PullRequest {
     /** True when the PR/MR is a draft or has a WIP title prefix. */
     draft: boolean;
     head: string;        // Branch name
+    headSha: string;     // HEAD commit SHA
     base: string;        // Target branch
     url: string;
     apiUrl: string;
@@ -194,6 +195,13 @@ export interface Forge {
 
     // --- CI ---
     getCommitStatuses(ref: string): Promise<CommitStatus[]>;
+    createCommitStatus(
+        ref: string,
+        state: CommitStatus['state'],
+        context: string,
+        description: string,
+        targetUrl?: string,
+    ): Promise<void>;
     getCheckRuns(ref: string): Promise<CheckRun[]>;
     getCheckRunLog(checkRunId: string): Promise<string>;
 

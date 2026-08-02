@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Security types — threat classification, trust model, audit log.
@@ -81,6 +81,42 @@ export function computeThresholds(trustScore: number): ThreatThresholds {
     };
 }
 
+// ─── Diff Assessment ────────────────────────────────────────────────
+
+/** Categories of files that form the execution surface of a repository. */
+export type ExecutionSurfaceCategory =
+    | 'ci_workflow'     // .github/workflows/**, .gitlab-ci.yml, Jenkinsfile, etc.
+    | 'build_system'    // CMakeLists.txt, *.cmake, Makefile, setup.py, meson.build
+    | 'dependency'      // package.json, lockfiles, requirements.txt, Gemfile
+    | 'container'       // Dockerfile, docker-compose.yml
+    | 'git_config'      // .gitmodules, .gitattributes (filter drivers execute on checkout)
+    | 'script';         // *.sh, *.ps1, *.bat in build-relevant paths
+
+/** A single file change that touches the execution surface. */
+export interface ExecutionSurfaceChange {
+    path: string;
+    category: ExecutionSurfaceCategory;
+    risk: 'critical' | 'high' | 'medium' | 'low';
+    detail: string;
+}
+
+/** Verdict the diff assessor produces. */
+export type DiffVerdict = 'pass' | 'fail' | 'review';
+
+/** Full result of assessing a PR's diff for threats. */
+export interface DiffAssessment {
+    verdict: DiffVerdict;
+    confidence: number;             // 0.0–1.0
+    executionSurfaceChanges: ExecutionSurfaceChange[];
+    authorTrust: UserTrustProfile;
+    reasoning: string;
+    evidence: string[];
+    assessedAt: Date;
+    commitSha: string;
+    /** Number of LLM calls consumed (0 when fast-pathed). */
+    llmCalls: number;
+}
+
 // ─── Sanitization ───────────────────────────────────────────────────
 
 export interface SanitizationResult {
@@ -116,7 +152,9 @@ export type AuditAction =
     | 'send_email'
     | 'key_rotation'
     | 'ci_check'
-    | 'watchdog_timeout';
+    | 'watchdog_timeout'
+    | 'assess_diff'
+    | 'gate_pr';
 
 export interface AuditEntry {
     id: string;           // Sequential: "00000001"

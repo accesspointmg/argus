@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 export { Pipeline, type PipelineConfig } from './pipeline';
 export { Evaluator } from './evaluator';
@@ -8,6 +8,7 @@ export { Transcriber } from './transcriber';
 export { CommentHandler, type CommentAction } from './comment-handler';
 export { EditDetector, type EditDetection } from './edit-detector';
 export { PRAnalyzer } from './pr-analyzer';
+export { PRGatekeeper, type GatekeeperConfig, type GatekeeperResult } from './pr-gatekeeper';
 export {
     type IssueState,
     type TrackedIssue,

@@ -4,8 +4,8 @@
   "description": "Autonomous AI agent that triages issues, investigates code, creates branches, and opens pull requests with full reasoning transcripts. Multi-forge (GitHub + GitLab), adversary-aware, cryptographically stamped.",
   "version": "0.1.0",
   "publisher": "accesspointmediagroupllc",
-  "icon": "media/argus-eye-128.png",
-  "license": "Apache-2.0",
+  "icon": "media/argus-icon.png",
+  "license": "Apache-2.0 OR MIT",
   "engines": {
     "vscode": "^1.95.0"
   },
@@ -27,7 +27,6 @@
     "type": "git",
     "url": "https://github.com/byrcolin/argus"
   },
-  "icon": "media/argus-icon.png",
   "activationEvents": [
     "onView:argus.workQueue",
     "onView:argus.recentActivity",
@@ -196,6 +195,16 @@
         "icon": "$(trash)"
       },
       {
+        "command": "argus.selectAiProvider",
+        "title": "Argus: Select AI Provider",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "argus.setAiKey",
+        "title": "Argus: Set AI Provider Key",
+        "icon": "$(key)"
+      },
+      {
         "command": "argus.setGitHubToken",
         "title": "Argus: Set GitHub Token",
         "icon": "$(key)"
@@ -286,6 +295,75 @@
           "items": {
             "type": "string"
           }
+        },
+        "argus.ai.provider": {
+          "type": "string",
+          "default": "vscode-lm",
+          "enum": [
+            "vscode-lm",
+            "anthropic",
+            "openai",
+            "gemini",
+            "ollama",
+            "openai-compatible"
+          ],
+          "enumDescriptions": [
+            "A model VS Code already provides (GitHub Copilot, or any extension that registers one). No API key needed.",
+            "Anthropic Claude, via the Anthropic API. Requires a key.",
+            "OpenAI GPT models, via the OpenAI API. Requires a key.",
+            "Google Gemini, via the Generative Language API. Requires a key.",
+            "A model running locally under Ollama. Nothing leaves this machine; no key needed.",
+            "Any endpoint speaking the OpenAI chat-completions API (Groq, Together, OpenRouter, vLLM, LM Studio, a gateway). Set argus.ai.baseUrl."
+          ],
+          "markdownDescription": "Which AI Argus uses. Run **Argus: Select AI Provider** to set this up interactively, including the API key.",
+          "order": 100
+        },
+        "argus.ai.model": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Model to use, e.g. `claude-opus-5`, `gpt-4o`, `gemini-2.0-flash`, `llama3.1`. Leave blank for the provider's default. For `vscode-lm` this selects the model family.",
+          "order": 101
+        },
+        "argus.ai.effort": {
+          "type": "string",
+          "default": "default",
+          "enum": [
+            "default",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "enumDescriptions": [
+            "Use the model's own default. Recommended.",
+            "Fastest and cheapest. Fine for classification, thin on hard judgement calls.",
+            "Reduced token use, some loss of depth.",
+            "Balanced — the provider default on current models.",
+            "Recommended for coding and agentic work. More thorough, more tokens.",
+            "Deepest reasoning, highest cost. Can overthink simple tasks."
+          ],
+          "markdownDescription": "How hard the model should think before answering. Honored by the **Anthropic** provider; others ignore it rather than guessing at an equivalent knob. Note `xhigh` and `max` are rejected by older models — leave this at `default` unless you know the model supports the level you pick.",
+          "order": 103
+        },
+        "argus.ai.baseUrl": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Endpoint override. Required for `openai-compatible`; optional for `ollama` (defaults to `http://localhost:11434`), `anthropic`, `openai`, and `gemini` when routing through a proxy or gateway.",
+          "order": 102
+        },
+        "argus.ai.vendor": {
+          "type": "string",
+          "default": "copilot",
+          "markdownDescription": "Only used when `#argus.ai.provider#` is `vscode-lm`: which registered chat-model vendor to select. `copilot` is the usual value.",
+          "order": 103
+        },
+        "argus.ai.maxTokens": {
+          "type": "number",
+          "default": 32000,
+          "minimum": 1024,
+          "markdownDescription": "Ceiling on a single reply. Needs to be generous — code generation returns whole files, and a truncated reply fails to parse. Ignored by `vscode-lm`, which negotiates its own limits.",
+          "order": 104
         },
         "argus.branchPrefix": {
           "type": "string",
@@ -465,7 +543,8 @@
         "argus.rateLimits.llmCallsPerHour": {
           "type": "number",
           "default": 100,
-          "description": "Maximum Copilot LM calls per hour."
+          "minimum": 1,
+          "markdownDescription": "Maximum AI model calls per hour, across every repository. A guard rail against runaway loops — with an API key configured, a retry that fails to back off bills a card. Exhausting it marks the current issue as stuck; the next poll retries it."
         },
         "argus.rateLimits.issuesPerHour": {
           "type": "number",
@@ -596,6 +675,7 @@
     "package": "vsce package"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
     "@octokit/rest": "^21.0.0",
     "nodemailer": "^6.9.0"
   },

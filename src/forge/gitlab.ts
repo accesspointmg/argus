@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * GitLab forge implementation — placeholder structure.
@@ -301,12 +301,32 @@ export class GitLabForge implements Forge {
 
     // ─── CI ─────────────────────────────────────────────────────────
 
+    async createCommitStatus(
+        ref: string,
+        state: CommitStatus['state'],
+        context: string,
+        description: string,
+        targetUrl?: string,
+    ): Promise<void> {
+        // GitLab uses 'failed' where GitHub uses 'failure'
+        const gitlabState = state === 'failure' ? 'failed' : state;
+        await this.api(`/projects/${this.projectPath}/statuses/${ref}`, {
+            method: 'POST',
+            body: JSON.stringify({
+                state: gitlabState,
+                name: context,
+                description,
+                ...(targetUrl && { target_url: targetUrl }),
+            }),
+        });
+    }
+
     async getCommitStatuses(ref: string): Promise<CommitStatus[]> {
         const data = await this.api<any[]>(
             `/projects/${this.projectPath}/repository/commits/${ref}/statuses`
         );
         return data.map((s) => ({
-            state: s.status as CommitStatus['state'],
+            state: (s.status === 'failed' ? 'failure' : s.status) as CommitStatus['state'],
             context: s.name,
             description: s.description || '',
             url: s.target_url || '',
@@ -527,6 +547,7 @@ export class GitLabForge implements Forge {
             state,
             draft: isDraft,
             head: data.source_branch || '',
+            headSha: data.sha || '',
             base: data.target_branch || '',
             url: data.web_url,
             apiUrl: `${this.baseUrl}/api/v4/projects/${this.projectPath}/merge_requests/${data.iid}`,

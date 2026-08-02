@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Bryan. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Evaluator — agentic, multi-turn issue evaluation with full code access.
@@ -14,12 +14,13 @@
  * worse than investigating a marginal one.
  */
 
-import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import type { Forge, Issue, TreeEntry } from '../forge/types';
 import type { IssueEvaluation } from './types';
 import type { Logger } from '../util/logger';
 import type { Sanitizer } from '../security/sanitizer';
+import type { ChatMessage, LlmService } from '../llm';
+import { assistant, user } from '../llm';
 
 /** Well-known manifest / config files that reveal what a project is. */
 const MANIFEST_FILES = [
@@ -46,6 +47,7 @@ export class Evaluator {
     constructor(
         private readonly logger: Logger,
         private readonly sanitizer: Sanitizer,
+        private readonly llm: LlmService,
     ) {}
 
     // ─── Public API ─────────────────────────────────────────────────
@@ -85,29 +87,18 @@ export class Evaluator {
             issue.labels, issue.author, issue.authorAssociation,
         );
 
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        if (models.length === 0) {
-            throw new Error('No Copilot language model available');
-        }
-        const model = models[0];
-
         // ── Multi-turn exploration loop ──
-        const messages: vscode.LanguageModelChatMessage[] = [
-            vscode.LanguageModelChatMessage.User(systemPrompt),
-            vscode.LanguageModelChatMessage.User(issuePrompt),
-        ];
+        // The system prompt is carried separately rather than as a leading turn,
+        // so it stays out of the channel the issue's own text arrives on.
+        const messages: ChatMessage[] = [user(issuePrompt)];
 
         for (let turn = 0; turn < MAX_EXPLORE_TURNS; turn++) {
             this.logger.info(`Evaluation turn ${turn + 1}/${MAX_EXPLORE_TURNS} for issue #${issue.number}`);
 
-            const response = await model.sendRequest(
-                messages, {}, new vscode.CancellationTokenSource().token,
-            );
-
-            let responseText = '';
-            for await (const chunk of response.text) {
-                responseText += chunk;
-            }
+            const responseText = await this.llm.chat({
+                system: systemPrompt,
+                messages,
+            });
 
             this.logger.info(
                 `LLM response (turn ${turn + 1}) for #${issue.number}: ` +
@@ -132,8 +123,8 @@ export class Evaluator {
             );
 
             // Add LLM's request and the file contents as follow-up messages
-            messages.push(vscode.LanguageModelChatMessage.Assistant(responseText));
-            messages.push(vscode.LanguageModelChatMessage.User(
+            messages.push(assistant(responseText));
+            messages.push(user(
                 `Here are the requested file contents:\n\n${fileContents}\n\n` +
                 `You may request more files with READ_FILES or provide your final JSON evaluation.`,
             ));
@@ -143,18 +134,15 @@ export class Evaluator {
         this.logger.warn(
             `Reached max exploration turns for #${issue.number}, forcing final verdict`,
         );
-        messages.push(vscode.LanguageModelChatMessage.User(
+        messages.push(user(
             'You have exhausted your file exploration budget. ' +
             'Provide your final JSON evaluation NOW based on what you have seen.',
         ));
 
-        const finalResponse = await model.sendRequest(
-            messages, {}, new vscode.CancellationTokenSource().token,
-        );
-        let finalText = '';
-        for await (const chunk of finalResponse.text) {
-            finalText += chunk;
-        }
+        const finalText = await this.llm.chat({
+            system: systemPrompt,
+            messages,
+        });
 
         this.logger.info(`Final forced response for #${issue.number}: ${finalText.substring(0, 500)}`);
         return this.parseFinalVerdict(finalText, canary, issue.number);

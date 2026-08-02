@@ -1,14 +1,15 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Investigator — uses code search & file reading to gather context for issue resolution.
  */
 
-import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import type { Forge } from '../forge/types';
 import type { IssueEvaluation } from './types';
 import type { Logger } from '../util/logger';
+import type { LlmService } from '../llm';
+import { user } from '../llm';
 
 export interface InvestigationResult {
     filesExamined: string[];
@@ -24,7 +25,10 @@ export interface InvestigationResult {
 }
 
 export class Investigator {
-    constructor(private readonly logger: Logger) {}
+    constructor(
+        private readonly logger: Logger,
+        private readonly llm: LlmService,
+    ) {}
 
     /**
      * Investigate the codebase for context relevant to an evaluated issue.
@@ -141,8 +145,7 @@ ${codeContext.substring(0, 20_000)}
 
 What specific changes are needed?`;
 
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        if (models.length === 0) {
+        if (!(await this.llm.isAvailable())) {
             // Fallback without LLM
             return {
                 filesExamined,
@@ -158,16 +161,10 @@ What specific changes are needed?`;
             };
         }
 
-        const messages = [
-            vscode.LanguageModelChatMessage.User(systemPrompt),
-            vscode.LanguageModelChatMessage.User(userPrompt),
-        ];
-
-        const response = await models[0].sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-        let responseText = '';
-        for await (const chunk of response.text) {
-            responseText += chunk;
-        }
+        const responseText = await this.llm.chat({
+            system: systemPrompt,
+            messages: [user(userPrompt)],
+        });
 
         if (!responseText.includes(canary)) {
             this.logger.warn('Canary missing from investigation — using raw file analysis');

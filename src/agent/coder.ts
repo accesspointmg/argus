@@ -1,4 +1,4 @@
-// Copyright 2026 Colin Byron. Apache-2.0 license.
+// Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
  * Coder — iterative code generation loop.
@@ -12,7 +12,6 @@
  * 7. If CI passes → done
  */
 
-import * as vscode from 'vscode';
 import { randomBytes } from 'crypto';
 import type { Forge } from '../forge/types';
 import type { CodingIteration, IssueEvaluation, TrackedIssue } from './types';
@@ -21,6 +20,8 @@ import type { OutputValidator } from '../security/validator';
 import type { StampManager } from '../crypto/stamp';
 import type { AuditLog } from '../crypto/audit';
 import type { Logger } from '../util/logger';
+import type { LlmService } from '../llm';
+import { user } from '../llm';
 
 export interface CodeChangeSet {
     files: { path: string; content: string }[];
@@ -35,6 +36,7 @@ export class Coder {
         private readonly validator: OutputValidator,
         private readonly stampManager: StampManager,
         private readonly auditLog: AuditLog,
+        private readonly llm: LlmService,
     ) {}
 
     /**
@@ -236,21 +238,10 @@ ${iterationContext}
 
 This is iteration ${iteration}. Generate the code changes.`;
 
-        const models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-        if (models.length === 0) {
-            throw new Error('No Copilot language model available');
-        }
-
-        const messages = [
-            vscode.LanguageModelChatMessage.User(systemPrompt),
-            vscode.LanguageModelChatMessage.User(userPrompt),
-        ];
-
-        const response = await models[0].sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
-        let responseText = '';
-        for await (const chunk of response.text) {
-            responseText += chunk;
-        }
+        const responseText = await this.llm.chat({
+            system: systemPrompt,
+            messages: [user(userPrompt)],
+        });
 
         if (!responseText.includes(canary)) {
             throw new Error('Canary verification failed in code generation');
