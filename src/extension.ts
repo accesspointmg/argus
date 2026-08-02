@@ -342,9 +342,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             const added = await addRepoToSettings(input);
             if (added) {
                 const label = formatRepoString(parsed);
-                config = readConfig(); // refresh in-memory config
+                config = readConfig();
                 refreshViews();
                 repoStatsProvider?.refresh();
+                updateHealthView(config);
                 vscode.window.showInformationMessage(`Added ${label} to Argus watch list.`);
                 logger.info(`Repo added: ${label}`);
             } else {
@@ -373,6 +374,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 config = readConfig();
                 refreshViews();
                 repoStatsProvider?.refresh();
+                updateHealthView(config);
                 vscode.window.showInformationMessage(`Removed ${picked.repoString} from watch list.`);
                 logger.info(`Repo removed: ${picked.repoString}`);
             }
@@ -448,7 +450,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 ).then((choice) => {
                     if (choice === 'Restart') {
                         stopPolling();
-                        startPolling(readConfig(), context);
+                        config = readConfig();
+                        updateHealthView(config);
+                        startPolling(config, context);
                     }
                 });
             }
