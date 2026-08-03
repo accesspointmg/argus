@@ -39,6 +39,15 @@ export const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5';
 /** Enables the `fallbacks` parameter below. */
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 
+/**
+ * Models known to support the server-side fallback beta.
+ * Others get the request without `fallbacks` / `betas` so they don't 400.
+ */
+const FALLBACK_ELIGIBLE_MODELS = new Set([
+    'claude-opus-5',
+    'claude-sonnet-4-20250514',
+]);
+
 export interface AnthropicOptions {
     apiKey: string;
     model?: string;
@@ -92,16 +101,22 @@ export class AnthropicProvider implements LlmProvider {
     }
 
     async chat(request: ChatRequest): Promise<string> {
-        const stream = this.client.beta.messages.stream({
+        const useFallback = FALLBACK_ELIGIBLE_MODELS.has(this.model);
+
+        const params: Record<string, unknown> = {
             model: this.model,
             max_tokens: request.maxTokens ?? this.options.defaultMaxTokens,
             ...(request.system ? { system: request.system } : {}),
             messages: request.messages.map((m) => ({ role: m.role, content: m.text })),
             thinking: { type: 'adaptive' },
             ...(this.options.effort ? { output_config: { effort: this.options.effort } } : {}),
-            betas: [FALLBACK_BETA],
-            fallbacks: 'default',
-        });
+            ...(useFallback ? { betas: [FALLBACK_BETA], fallbacks: 'default' } : {}),
+        };
+
+        // Use beta stream when fallback is enabled, regular stream otherwise.
+        const stream = useFallback
+            ? this.client.beta.messages.stream(params as any)
+            : this.client.messages.stream(params as any);
 
         const message = await stream.finalMessage();
 
@@ -109,20 +124,21 @@ export class AnthropicProvider implements LlmProvider {
         // or holds a partial, and treating either as a real answer would let a
         // declined request read as "nothing suspicious found".
         if (message.stop_reason === 'refusal') {
-            const details = message.stop_details;
+            const details = (message as any).stop_details;
             const category = details?.type === 'refusal' ? details.category ?? undefined : undefined;
             throw new LlmRefusalError(
                 `${this.model} declined the request` +
-                `${category ? ` (${category})` : ''} and the fallback model did not answer it either.`,
+                `${category ? ` (${category})` : ''}` +
+                (useFallback ? ' and the fallback model did not answer it either.' : '.'),
                 category,
             );
         }
 
         // Thinking blocks are dropped — callers want the answer, and on current
         // models the raw reasoning is not returned anyway.
-        return message.content
-            .filter((block): block is Anthropic.Beta.BetaTextBlock => block.type === 'text')
-            .map((block) => block.text)
+        return (message.content as any[])
+            .filter((block: any) => block.type === 'text')
+            .map((block: any) => block.text)
             .join('');
     }
 }

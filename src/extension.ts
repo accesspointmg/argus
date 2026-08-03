@@ -65,6 +65,8 @@ import {
     SystemHealthProvider,
 } from './ui/treeview';
 import { StatusBar } from './ui/statusbar';
+import { RepoSettingsPanel } from './ui/repo-settings-panel';
+import { ArgusSettingsPanel } from './ui/argus-settings-panel';
 
 // ─── Globals ────────────────────────────────────────────────────────
 
@@ -153,6 +155,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     pipeline.setGatekeeper(gatekeeper);
 
     // ── Email ──
+    // Inject SMTP password from SecretStorage before initializing
+    const smtpPass = await context.secrets.get('argus.smtpPassword') ?? '';
+    config.email.smtp.pass = smtpPass;
     const emailSender = new EmailSender(config.email, logger);
     await emailSender.initialize();
     const notificationRouter = new NotificationRouter(emailSender, logger);
@@ -273,6 +278,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             }
         }),
 
+        vscode.commands.registerCommand('argus.setSmtpPassword', async () => {
+            const password = await vscode.window.showInputBox({
+                title: 'Set SMTP Password',
+                prompt: 'Enter the SMTP password (or app password) for Argus email notifications',
+                password: true,
+                placeHolder: 'SMTP password',
+                validateInput: (v) => v.trim() ? undefined : 'Password cannot be empty',
+            });
+            if (!password) { return; }
+            await context.secrets.store('argus.smtpPassword', password.trim());
+            config.email.smtp.pass = password.trim();
+            emailSender.updateConfig({ smtp: config.email.smtp });
+            vscode.window.showInformationMessage('SMTP password saved. Restart Argus to re-verify the connection.');
+            logger.info('SMTP password updated.');
+        }),
+
         vscode.commands.registerCommand('argus.clearTokens', async () => {
             const pick = await vscode.window.showQuickPick(
                 [
@@ -296,15 +317,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
                 vscode.window.showInformationMessage('No repos configured. Use "Argus: Add Repository" to add one.');
                 return;
             }
-            const items = repos.map((r) => ({
+            const items = repos.map((r, idx) => ({
                 label: `$(repo) ${r.owner}/${r.repo}`,
-                description: r.forge,
+                description: r.forge + (r.email?.recipients?.length ? ` \u2022 ${r.email.recipients.length} recipient(s)` : ''),
                 detail: `Poll every ${r.pollIntervalMinutes} min`,
+                idx,
             }));
-            await vscode.window.showQuickPick(items, {
+            const picked = await vscode.window.showQuickPick(items, {
                 title: `Argus Repositories (${repos.length})`,
-                placeHolder: 'Configured repositories',
+                placeHolder: 'Select a repo to configure',
             });
+            if (!picked) { return; }
+            const repo = repos[picked.idx];
+            const rawRepos: (string | Record<string, any>)[] = vscode.workspace.getConfiguration('argus').get('repos', []);
+            RepoSettingsPanel.show(context.extensionUri, repo, rawRepos, async (updated) => {
+                await vscode.workspace.getConfiguration('argus').update('repos', updated, vscode.ConfigurationTarget.Global);
+                config = readConfig();
+                refreshViews();
+                repoStatsProvider?.refresh();
+                updateHealthView(config);
+            });
+        }),
+
+        vscode.commands.registerCommand('argus.openSettings', () => {
+            ArgusSettingsPanel.show(context.extensionUri, context.secrets);
         }),
 
         vscode.commands.registerCommand('argus.addRepo', async () => {

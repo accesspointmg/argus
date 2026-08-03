@@ -7,12 +7,27 @@
 /** Supported forge platforms. */
 export type ForgePlatform = 'github' | 'gitlab';
 
+/** Per-repo email overrides. If omitted, the global Argus email config is used. */
+export interface RepoEmailConfig {
+    /** Recipients for this repo. Overrides the global default when set. */
+    recipients?: string[];
+    /** Optional per-repo SMTP — if omitted, the global SMTP transport is used. */
+    smtp?: {
+        host?: string;
+        port?: number;
+        secure?: boolean;
+        user?: string;
+    };
+}
+
 /** Configuration for a single monitored repository. */
 export interface RepoConfig {
     forge: ForgePlatform;
     owner: string;
     repo: string;
     pollIntervalMinutes: number;
+    /** Per-repo email overrides. Falls back to global Argus email if absent. */
+    email?: RepoEmailConfig;
 }
 
 /** Unique identifier for a repo across forges. */

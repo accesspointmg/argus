@@ -77,13 +77,13 @@
       },
       {
         "view": "argus.workQueue",
-        "contents": "No issues in queue.\n\n[$(add) Add Repository](command:argus.addRepo)\n\n[$(play) Start Argus](command:argus.start)\n[$(sync) Poll Now](command:argus.pollNow)\n\n[$(list-unordered) List Repos](command:argus.listRepos)",
+        "contents": "No issues in queue.\n\n[$(add) Add Repository](command:argus.addRepo)\n\n[$(play) Start Argus](command:argus.start)\n[$(sync) Poll Now](command:argus.pollNow)\n\n[$(list-unordered) List Repos](command:argus.listRepos)\n[$(settings-gear) Settings](command:argus.openSettings)",
         "when": "!argus.isRunning && (argus.hasGitHubToken || argus.hasGitLabToken)"
       },
       {
         "view": "argus.workQueue",
-        "contents": "Polling for issues...\nNo items in queue yet.",
-        "when": "argus.isRunning"
+        "contents": "Polling for issues...\nNo items in queue yet.\n\n[$(debug-stop) Stop Argus](command:argus.stop)\n[$(error) Emergency Stop](command:argus.emergencyStop)\n\n[$(list-unordered) List Repos](command:argus.listRepos)\n[$(settings-gear) Settings](command:argus.openSettings)",
+                  "when": "argus.isRunning"
       },
       {
         "view": "argus.recentActivity",
@@ -91,7 +91,7 @@
       },
       {
         "view": "argus.repoStats",
-        "contents": "No repositories configured.\n\n[$(key) Set GitHub Token](command:argus.setGitHubToken)\n[$(add) Add Repository](command:argus.addRepo)\n[$(list-unordered) List Repos](command:argus.listRepos)"
+        "contents": "No repositories configured.\n\n[$(key) Set GitHub Token](command:argus.setGitHubToken)\n[$(add) Add Repository](command:argus.addRepo)\n[$(list-unordered) List Repos](command:argus.listRepos)\n[$(settings-gear) Settings](command:argus.openSettings)"
       },
       {
         "view": "argus.security",
@@ -214,14 +214,24 @@
         "title": "Argus: Set GitLab Token",
         "icon": "$(key)"
       },
+            {
+        "command": "argus.setSmtpPassword",
+        "title": "Argus: Set SMTP Password",
+        "icon": "$(key)"
+      },
       {
         "command": "argus.clearTokens",
         "title": "Argus: Clear Token"
       },
-      {
+            {
         "command": "argus.listRepos",
         "title": "Argus: List Repositories",
         "icon": "$(list-unordered)"
+      },
+      {
+        "command": "argus.openSettings",
+        "title": "Argus: Settings",
+        "icon": "$(settings-gear)"
       }
     ],
     "menus": {
@@ -273,7 +283,7 @@
           "when": "view == argus.workQueue",
           "group": "navigation"
         },
-        {
+                {
           "command": "argus.removeRepo",
           "when": "view == argus.repoStats",
           "group": "navigation"
@@ -282,18 +292,60 @@
           "command": "argus.addRepo",
           "when": "view == argus.repoStats",
           "group": "navigation"
+        },
+        {
+          "command": "argus.openSettings",
+          "when": "view == argus.systemHealth",
+          "group": "navigation"
         }
       ]
     },
     "configuration": {
       "title": "Argus — AI Issue Agent",
       "properties": {
-        "argus.repos": {
+                "argus.repos": {
           "type": "array",
           "default": [],
-          "description": "Repositories to monitor. Paste URLs (https://github.com/owner/repo.git), SSH URLs, or shorthand (owner/repo).",
+          "markdownDescription": "Repositories to monitor. Each entry can be a URL string, shorthand (`owner/repo`), or an object with per-repo email overrides:\n```json\n[\n  \"owner/repo-a\",\n  {\n    \"repo\": \"owner/repo-b\",\n    \"email\": {\n      \"recipients\": [\"john@example.com\", \"jane@example.com\"],\n      \"smtp\": { \"host\": \"smtp.example.com\", \"user\": \"alerts@example.com\" }\n    }\n  }\n]\n```\nRepos without an `email` block inherit the global `argus.email.*` settings.",
           "items": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "string",
+                "description": "Repository URL, SSH URL, or shorthand (owner/repo)"
+              },
+              {
+                "type": "object",
+                "description": "Repository with per-repo email overrides",
+                "required": ["repo"],
+                "properties": {
+                  "repo": {
+                    "type": "string",
+                    "description": "Repository URL, SSH URL, or shorthand (owner/repo)"
+                  },
+                  "email": {
+                    "type": "object",
+                    "description": "Per-repo email overrides. Omitted fields fall back to global argus.email.* settings.",
+                    "properties": {
+                      "recipients": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Email addresses to notify for this repo. Overrides argus.email.defaultRecipients."
+                      },
+                      "smtp": {
+                        "type": "object",
+                        "description": "Optional SMTP override for this repo. Missing fields inherit from argus.email.smtp.",
+                        "properties": {
+                          "host": { "type": "string" },
+                          "port": { "type": "number" },
+                          "secure": { "type": "boolean" },
+                          "user": { "type": "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
           }
         },
         "argus.ai.provider": {
@@ -576,26 +628,40 @@
           "default": false,
           "description": "Enable email notifications."
         },
-        "argus.email.smtp": {
+                "argus.email.smtp": {
           "type": "object",
           "default": {},
-          "description": "SMTP configuration (host, port, secure, user). Password stored in SecretStorage.",
+          "markdownDescription": "Global SMTP configuration. The password is stored securely — run **Argus: Set SMTP Password** from the command palette.",
           "properties": {
             "host": {
-              "type": "string"
+              "type": "string",
+              "description": "SMTP server hostname (e.g. smtp.gmail.com)"
             },
             "port": {
               "type": "number",
-              "default": 587
+              "default": 587,
+              "description": "SMTP port (587 for STARTTLS, 465 for SSL)"
             },
             "secure": {
               "type": "boolean",
-              "default": true
+              "default": false,
+              "description": "True for port 465 (SSL), false for 587 (STARTTLS)"
             },
             "user": {
-              "type": "string"
+              "type": "string",
+              "description": "SMTP username / email address"
             }
           }
+        },
+        "argus.email.fromAddress": {
+          "type": "string",
+          "default": "",
+          "description": "The From address shown on outgoing emails."
+        },
+        "argus.email.fromName": {
+          "type": "string",
+          "default": "Argus",
+          "description": "The display name shown on outgoing emails."
         },
         "argus.email.defaultRecipients": {
           "type": "array",
@@ -603,7 +669,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Default email recipients."
+          "markdownDescription": "Default email recipients when a repo has no per-repo `email.recipients` override."
         },
         "argus.email.events": {
           "type": "object",

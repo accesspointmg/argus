@@ -5,9 +5,10 @@
  */
 
 import * as vscode from 'vscode';
-import type { RepoConfig, ForgePlatform } from '../forge/types';
+import type { RepoConfig, RepoEmailConfig, ForgePlatform, RepoKey } from '../forge/types';
+import { repoKey } from '../forge/types';
 import type { LogLevel } from './logger';
-import type { EmailConfig } from '../notifications/email';
+import type { EmailConfig, RepoEmailOverride } from '../notifications/email';
 import type { PipelineConfig } from '../agent/pipeline';
 
 export interface ArgusConfig {
@@ -24,25 +25,29 @@ export interface ArgusConfig {
 export function readConfig(): ArgusConfig {
     const cfg = vscode.workspace.getConfiguration('argus');
 
-    // Parse repos from settings — each entry can be a URL, "github:owner/repo", or "owner/repo"
-    const repoStrings: string[] = cfg.get('repos', []);
+    // Parse repos from settings — each entry can be a string or an object with email overrides
+    const repoEntries: (string | Record<string, any>)[] = cfg.get('repos', []);
     const defaultInterval: number = cfg.get('pollIntervalMinutes', 5);
 
-    const repos: RepoConfig[] = repoStrings
-        .map((r) => parseRepoInput(r, defaultInterval))
+    const repos: RepoConfig[] = repoEntries
+        .map((r) => parseRepoEntry(r, defaultInterval))
         .filter((r): r is RepoConfig => r !== null);
 
-    // Email config
+    // Email config — SMTP password is injected later from SecretStorage
+    const smtpObj: Record<string, any> = cfg.get('email.smtp', {});
     const emailCfg: EmailConfig = {
         enabled: cfg.get('email.enabled', false),
-        smtpHost: cfg.get('email.smtpHost', ''),
-        smtpPort: cfg.get('email.smtpPort', 587),
-        smtpSecure: cfg.get('email.smtpSecure', false),
-        smtpUser: cfg.get('email.smtpUser', ''),
-        smtpPass: '',  // Will be read from SecretStorage
+        smtp: {
+            host: smtpObj.host ?? '',
+            port: smtpObj.port ?? 587,
+            secure: smtpObj.secure ?? false,
+            user: smtpObj.user ?? '',
+            pass: '',  // Injected from SecretStorage in extension.ts
+        },
         fromAddress: cfg.get('email.fromAddress', ''),
         fromName: cfg.get('email.fromName', 'Argus'),
-        toAddresses: cfg.get('email.toAddresses', []),
+        defaultRecipients: cfg.get('email.defaultRecipients', []),
+        repoOverrides: buildRepoEmailOverrides(repos),
     };
 
     return {
@@ -55,6 +60,35 @@ export function readConfig(): ArgusConfig {
         logLevel: cfg.get('logLevel', 'info') as LogLevel,
         email: emailCfg,
     };
+}
+
+/**
+ * Parse a repo entry from settings. Accepts:
+ *   - A plain string (any format parseRepoInput accepts)
+ *   - An object: { repo: "owner/repo", email: { recipients: [...], smtp: {...} } }
+ */
+export function parseRepoEntry(input: string | Record<string, any>, defaultInterval: number = 5): RepoConfig | null {
+    if (typeof input === 'string') {
+        return parseRepoInput(input, defaultInterval);
+    }
+
+    // Object form: { repo: "...", email?: { recipients?: [...], smtp?: {...} } }
+    const repoStr = input.repo || input.url || '';
+    const parsed = parseRepoInput(String(repoStr), defaultInterval);
+    if (!parsed) { return null; }
+
+    if (input.email && typeof input.email === 'object') {
+        const email: RepoEmailConfig = {};
+        if (Array.isArray(input.email.recipients)) {
+            email.recipients = input.email.recipients;
+        }
+        if (input.email.smtp && typeof input.email.smtp === 'object') {
+            email.smtp = input.email.smtp;
+        }
+        parsed.email = email;
+    }
+
+    return parsed;
 }
 
 /**
@@ -166,6 +200,28 @@ export async function removeRepoFromSettings(repoString: string): Promise<boolea
 
     await cfg.update('repos', filtered, vscode.ConfigurationTarget.Global);
     return true;
+}
+
+/**
+ * Build per-repo email overrides from parsed RepoConfigs.
+ */
+function buildRepoEmailOverrides(repos: RepoConfig[]): Map<RepoKey, RepoEmailOverride> {
+    const map = new Map<RepoKey, RepoEmailOverride>();
+    for (const repo of repos) {
+        if (repo.email && (repo.email.recipients?.length || repo.email.smtp)) {
+            const key = repoKey(repo);
+            map.set(key, {
+                recipients: repo.email.recipients ?? [],
+                smtp: repo.email.smtp ? {
+                    host: repo.email.smtp.host,
+                    port: repo.email.smtp.port,
+                    secure: repo.email.smtp.secure,
+                    user: repo.email.smtp.user,
+                } : undefined,
+            });
+        }
+    }
+    return map;
 }
 
 /**

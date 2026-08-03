@@ -6,6 +6,7 @@
 
 import type { EmailSender } from './email';
 import type { Logger } from '../util/logger';
+import type { RepoKey } from '../forge/types';
 import type { TrackedIssue, IssueEvaluation, PRAnalysis, CodingIteration } from '../agent/types';
 import * as templates from './templates';
 
@@ -22,19 +23,19 @@ export class NotificationRouter {
         private readonly logger: Logger,
     ) {}
 
-    async onIssueEvaluated(issue: TrackedIssue, evaluation: IssueEvaluation): Promise<void> {
+    async onIssueEvaluated(issue: TrackedIssue, evaluation: IssueEvaluation, repoKey?: RepoKey): Promise<void> {
         try {
             const msg = templates.issueEvaluated(issue, evaluation);
-            await this.emailSender.send(msg);
+            await this.emailSender.send(msg, repoKey);
         } catch (err) {
             this.logger.warn(`Failed to send issue evaluation email: ${err}`);
         }
     }
 
-    async onPRCreated(issue: TrackedIssue, iterations: CodingIteration[]): Promise<void> {
+    async onPRCreated(issue: TrackedIssue, iterations: CodingIteration[], repoKey?: RepoKey): Promise<void> {
         try {
             const msg = templates.prCreated(issue, iterations);
-            await this.emailSender.send(msg);
+            await this.emailSender.send(msg, repoKey);
         } catch (err) {
             this.logger.warn(`Failed to send PR created email: ${err}`);
         }
@@ -46,28 +47,29 @@ export class NotificationRouter {
         classification: string,
         confidence: number,
         actions: string[],
+        repoKey?: RepoKey,
     ): Promise<void> {
         try {
             const msg = templates.threatDetected(repo, username, classification, confidence, actions);
-            await this.emailSender.send(msg);
+            await this.emailSender.send(msg, repoKey);
         } catch (err) {
             this.logger.warn(`Failed to send threat detection email: ${err}`);
         }
     }
 
-    async onCompetingPRsAnalyzed(issue: TrackedIssue, analyses: PRAnalysis[]): Promise<void> {
+    async onCompetingPRsAnalyzed(issue: TrackedIssue, analyses: PRAnalysis[], repoKey?: RepoKey): Promise<void> {
         try {
             const msg = templates.competingPRsAnalyzed(issue, analyses);
-            await this.emailSender.send(msg);
+            await this.emailSender.send(msg, repoKey);
         } catch (err) {
             this.logger.warn(`Failed to send competing PR email: ${err}`);
         }
     }
 
-    async onPipelineError(issueNumber: number, repo: string, error: string): Promise<void> {
+    async onPipelineError(issueNumber: number, repo: string, error: string, repoKey?: RepoKey): Promise<void> {
         try {
             const msg = templates.pipelineError(issueNumber, repo, error);
-            await this.emailSender.send(msg);
+            await this.emailSender.send(msg, repoKey);
         } catch (err) {
             this.logger.warn(`Failed to send pipeline error email: ${err}`);
         }

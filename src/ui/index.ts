@@ -2,3 +2,5 @@
 
 export { WorkQueueProvider, ActivityProvider, RepoStatsProvider, SecurityProvider, SystemHealthProvider } from './treeview';
 export { StatusBar, type ArgusStatus } from './statusbar';
+export { RepoSettingsPanel } from './repo-settings-panel';
+export { ArgusSettingsPanel } from './argus-settings-panel';
