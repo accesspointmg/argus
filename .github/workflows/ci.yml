@@ -57,7 +57,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/argus-artifacts/verify/${{ github.sha }}
+  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/artifacts/github/accesspointmg/argus/verify/${{ github.sha }}
 
 jobs:
   # ===========================================================================

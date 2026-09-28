@@ -56,7 +56,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/argus-artifacts/release/${{ github.run_number }}
+  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/artifacts/github/accesspointmg/argus/release/${{ github.run_number }}
 
 jobs:
   # ===========================================================================
@@ -135,7 +135,7 @@ jobs:
 
           # Cleanup old artifacts (keep last 10 releases)
           echo "🧹 Cleaning up old local artifacts..."
-          cd /Volumes/4TBNVMEEXT/argus-artifacts/release 2>/dev/null || mkdir -p /Volumes/4TBNVMEEXT/argus-artifacts/release
+          cd /Volumes/4TBNVMEEXT/artifacts/github/accesspointmg/argus/release 2>/dev/null || mkdir -p /Volumes/4TBNVMEEXT/artifacts/github/accesspointmg/argus/release
           ls -dt */ 2>/dev/null | tail -n +11 | xargs rm -rf 2>/dev/null || true
           echo "✅ Cleanup complete"
 
