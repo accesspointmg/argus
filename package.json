@@ -832,7 +832,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^20.0.0",
+    "@types/node": "^26.6.5",
     "@types/nodemailer": "^8.0.2",
     "@types/vscode": "^1.95.0",
     "@vscode/test-electron": "^3.1.0",
