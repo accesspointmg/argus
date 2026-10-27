@@ -827,19 +827,22 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.115.0",
     "@octokit/rest": "^21.0.0",
-    "nodemailer": "^6.9.0"
+    "nodemailer": "^10.2.1"
   },
   "devDependencies": {
-    "@types/mocha": "^10.0.0",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.0.0",
-    "@types/nodemailer": "^6.4.0",
+    "@types/nodemailer": "^8.0.2",
     "@types/vscode": "^1.95.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "@vscode/test-electron": "^2.4.0",
-    "@vscode/vsce": "^3.0.0",
+    "@vscode/vsce": "^3.9.2",
     "eslint": "^8.56.0",
-    "mocha": "^10.0.0",
+    "mocha": "^12.0.3",
     "typescript": "^5.5.0"
+  },
+  "overrides": {
+    "@azure/msal-node": "^7.0.3"
   }
 }
