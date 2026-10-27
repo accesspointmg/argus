@@ -1,0 +1,53 @@
+# =============================================================================
+# MARKETPLACE IDENTITY CHECK
+# =============================================================================
+# Manual helper for the Entra ID publishing setup:
+#   1. Prints the Azure DevOps profile ID of the publishing identity. Add that
+#      ID to the Marketplace publisher (Members → Add, role Contributor).
+#   2. Verifies the identity can publish as accesspointmediagroupllc.
+#
+# Run from main. The identity trusts `repo:accesspointmg/argus:ref:refs/heads/main`
+# for this check, and the `marketplace` environment for real releases.
+# =============================================================================
+
+name: Marketplace Identity Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  identity:
+    name: "Show identity and verify"
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sign in to Microsoft Entra ID
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Azure DevOps profile ID (add this to the publisher)
+        run: |
+          az rest --method get \
+            --resource 499b84ac-1321-427f-aa17-267ca6975798 \
+            --url "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1-preview.3" \
+            --query "{profileId: id, displayName: displayName}" -o table
+
+      - name: Verify it can publish
+        run: npx vsce verify-pat --azure-credential accesspointmediagroupllc

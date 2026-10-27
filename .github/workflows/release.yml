@@ -180,8 +180,14 @@ jobs:
     needs: [build, release]
     if: github.event_name == 'push' || inputs.publish_marketplace == true
     runs-on: ubuntu-latest
-    # The environment only allows v* tags; keep VSCE_PAT as an environment secret.
+    # The environment only allows v* tags. Publishing signs in with Microsoft
+    # Entra ID (workload identity federation): GitHub proves this job's identity,
+    # so no token is stored. Global PATs stop working on 2026-12-01; VSCE_PAT is
+    # only a fallback until the Entra identity is configured.
     environment: marketplace
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -198,13 +204,28 @@ jobs:
         with:
           name: vsix
 
+      # Environment variables (not secrets) on `marketplace`: AZURE_CLIENT_ID, AZURE_TENANT_ID.
+      - name: Sign in to Microsoft Entra ID
+        if: vars.AZURE_CLIENT_ID != ''
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
       - name: Publish
         env:
+          USE_ENTRA: ${{ vars.AZURE_CLIENT_ID != '' }}
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          VSIX: ${{ needs.build.outputs.vsix_name }}
         run: |
-          if [ -z "$VSCE_PAT" ]; then
-            echo "⚠️  VSCE_PAT secret not set — skipping marketplace publish"
-            exit 0
+          if [ "$USE_ENTRA" = "true" ]; then
+            npx vsce publish --azure-credential --packagePath "$VSIX"
+          elif [ -n "$VSCE_PAT" ]; then
+            echo "::warning::Publishing with VSCE_PAT. Global PATs stop working on 2026-12-01 — configure Entra ID."
+            npx vsce publish --pat "$VSCE_PAT" --packagePath "$VSIX"
+          else
+            echo "::error::No Marketplace credentials: set AZURE_CLIENT_ID/AZURE_TENANT_ID on the marketplace environment."
+            exit 1
           fi
-          npx vsce publish --pat "$VSCE_PAT" --packagePath "${{ needs.build.outputs.vsix_name }}"
           echo "✅ Published to marketplace"
