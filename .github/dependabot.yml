@@ -17,6 +17,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Must not exceed engines.vscode in package.json (vsce rejects the package
+      # otherwise). Raise both together, deliberately.
+      - dependency-name: "@types/vscode"
     groups:
       dev-dependencies:
         dependency-type: development

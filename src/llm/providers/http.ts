@@ -81,7 +81,7 @@ export async function postJson<T>(options: {
         // `fetch` reports both the same way, so say which without pretending to
         // know more than we do.
         if (err instanceof Error && err.name === 'AbortError') {
-            throw new Error('Request aborted (cancelled or timed out)');
+            throw new Error('Request aborted (cancelled or timed out)', { cause: err });
         }
         throw err;
     } finally {
