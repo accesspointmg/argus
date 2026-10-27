@@ -27,3 +27,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local VS Code multi-root workspaces
+*.code-workspace
