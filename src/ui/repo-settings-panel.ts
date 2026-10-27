@@ -1,13 +1,31 @@
 // Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
- * Repo Settings webview — configure a single repository's settings
- * (email recipients, SMTP override, poll interval) in a friendly panel.
+ * Repo Settings webview — per-repository email recipients and SMTP override.
+ *
+ * Same model as the global panel: static CSP-locked page
+ * (`media/webview/repo-settings.js`), data by `postMessage`, and every
+ * message validated here before the `argus.repos` entry is rewritten.
  */
 
 import * as vscode from 'vscode';
 import type { RepoConfig } from '../forge/types';
 import { formatRepoString, parseRepoEntry } from '../util/config';
+import { checks, isRecord } from './settings-model';
+import { errorText, panelOptions, renderShell } from './webview';
+
+/** Raw `argus.repos` entry: a repo string or an object with overrides. */
+export type RawRepoEntry = string | Record<string, unknown>;
+
+const MAX_RECIPIENTS = 100;
+
+interface RepoEmailForm {
+    recipients: string[];
+    smtpHost: string;
+    smtpPort: number | null;
+    smtpSecure: boolean;
+    smtpUser: string;
+}
 
 export class RepoSettingsPanel {
     public static readonly viewType = 'argus.repoSettings';
@@ -15,16 +33,19 @@ export class RepoSettingsPanel {
 
     private readonly panel: vscode.WebviewPanel;
     private readonly repoKey: string;
-    private disposables: vscode.Disposable[] = [];
+    private readonly disposables: vscode.Disposable[] = [];
 
     /**
-     * Show (or re-focus) the settings panel for a specific repo.
+     * Show (or re-focus) the settings panel for a repo.
+     *
+     * `allRepos` is only a fallback: on save the current `argus.repos` global
+     * value is re-read so concurrent edits aren't clobbered.
      */
     static show(
         extensionUri: vscode.Uri,
         repo: RepoConfig,
-        allRepos: (string | Record<string, any>)[],
-        onSave: (updated: (string | Record<string, any>)[]) => Promise<void>,
+        allRepos: readonly unknown[],
+        onSave: (updated: unknown[]) => Promise<void>,
     ): void {
         const key = formatRepoString(repo);
         const existing = RepoSettingsPanel.panels.get(key);
@@ -32,47 +53,33 @@ export class RepoSettingsPanel {
             existing.panel.reveal();
             return;
         }
-        new RepoSettingsPanel(extensionUri, repo, allRepos, onSave);
+        RepoSettingsPanel.panels.set(key, new RepoSettingsPanel(extensionUri, repo, allRepos, onSave));
     }
 
     private constructor(
         extensionUri: vscode.Uri,
         private repo: RepoConfig,
-        private allRepos: (string | Record<string, any>)[],
-        private readonly onSave: (updated: (string | Record<string, any>)[]) => Promise<void>,
+        private readonly allRepos: readonly unknown[],
+        private readonly onSave: (updated: unknown[]) => Promise<void>,
     ) {
         this.repoKey = formatRepoString(repo);
-
         this.panel = vscode.window.createWebviewPanel(
             RepoSettingsPanel.viewType,
             `Repo: ${repo.owner}/${repo.repo}`,
             vscode.ViewColumn.One,
-            {
-                enableScripts: true,
-                retainContextWhenHidden: true,
-                localResourceRoots: [vscode.Uri.joinPath(extensionUri, 'media')],
-            },
+            panelOptions(extensionUri),
         );
-
-        RepoSettingsPanel.panels.set(this.repoKey, this);
-
         this.panel.iconPath = new vscode.ThemeIcon('repo');
-        this.panel.webview.html = this.getHtml();
+        this.panel.webview.html = renderShell(this.panel.webview, extensionUri, {
+            title: 'Repository Settings',
+            script: 'repo-settings.js',
+        });
 
-        this.panel.webview.onDidReceiveMessage(
-            async (msg) => {
-                switch (msg.command) {
-                    case 'save':
-                        await this.handleSave(msg.data);
-                        break;
-                    case 'cancel':
-                        this.panel.dispose();
-                        break;
-                }
-            },
-            undefined,
-            this.disposables,
-        );
+        this.panel.webview.onDidReceiveMessage((msg: unknown) => {
+            this.onMessage(msg).catch((err) => {
+                vscode.window.showErrorMessage(`Argus repo settings: ${errorText(err)}`);
+            });
+        }, undefined, this.disposables);
 
         this.panel.onDidDispose(() => {
             RepoSettingsPanel.panels.delete(this.repoKey);
@@ -80,244 +87,141 @@ export class RepoSettingsPanel {
         });
     }
 
-    private async handleSave(data: any): Promise<void> {
-        // Build the updated repo entry
-        const hasEmail = (data.recipients?.length > 0) || data.smtpHost;
-        let updatedEntry: string | Record<string, any>;
+    private async onMessage(msg: unknown): Promise<void> {
+        if (!isRecord(msg) || typeof msg.type !== 'string') { return; }
+        switch (msg.type) {
+            case 'ready':
+                this.sendInit();
+                return;
+            case 'save':
+                await this.handleSave(msg.data);
+                return;
+            case 'cancel':
+                this.panel.dispose();
+                return;
+        }
+    }
 
-        if (hasEmail) {
-            const entry: Record<string, any> = {
-                repo: formatRepoString(this.repo),
-            };
-            const email: Record<string, any> = {};
-            if (data.recipients && data.recipients.length > 0) {
-                email.recipients = data.recipients;
-            }
-            if (data.smtpHost) {
-                email.smtp = {
-                    ...(data.smtpHost ? { host: data.smtpHost } : {}),
-                    ...(data.smtpPort ? { port: Number(data.smtpPort) } : {}),
-                    ...(data.smtpSecure !== undefined ? { secure: data.smtpSecure } : {}),
-                    ...(data.smtpUser ? { user: data.smtpUser } : {}),
-                };
-            }
-            entry.email = email;
-            updatedEntry = entry;
-        } else {
-            updatedEntry = formatRepoString(this.repo);
+    private sendInit(): void {
+        const email = this.repo.email ?? {};
+        void this.panel.webview.postMessage({
+            type: 'init',
+            title: `${this.repo.owner}/${this.repo.repo}`,
+            forge: this.repo.forge,
+            recipients: email.recipients ?? [],
+            smtp: {
+                host: email.smtp?.host ?? '',
+                port: email.smtp?.port ?? null,
+                secure: email.smtp?.secure ?? false,
+                user: email.smtp?.user ?? '',
+            },
+        });
+    }
+
+    private async handleSave(raw: unknown): Promise<void> {
+        const parsed = parseForm(raw);
+        if ('errors' in parsed) {
+            void this.panel.webview.postMessage({ type: 'saved', ok: false, errors: parsed.errors });
+            return;
+        }
+        const form = parsed.form;
+
+        const configured = vscode.workspace.getConfiguration('argus').inspect<unknown[]>('repos')?.globalValue;
+        const current = Array.isArray(configured) ? configured : [...this.allRepos];
+        let matched = false;
+        const updated = current.map((entry) => {
+            if (!this.matches(entry)) { return entry; }
+            matched = true;
+            return withEmail(entry as RawRepoEntry, form);
+        });
+        if (!matched) {
+            void this.panel.webview.postMessage({
+                type: 'saved', ok: false,
+                errors: { _form: 'This repository is no longer in argus.repos.' },
+            });
+            return;
         }
 
-        // Replace this repo's entry in the array
-        const targetKey = this.repoKey;
-        const updated = this.allRepos.map((r) => {
-            const parsed = parseRepoEntry(r);
-            if (parsed && formatRepoString(parsed) === targetKey) {
-                return updatedEntry;
-            }
-            return r;
-        });
-
         await this.onSave(updated);
+        const fresh = updated.find((e) => this.matches(e));
+        const reparsed = fresh !== undefined ? parseRepoEntry(fresh as RawRepoEntry, this.repo.pollIntervalMinutes) : null;
+        if (reparsed) { this.repo = { ...this.repo, email: reparsed.email }; }
+        void this.panel.webview.postMessage({ type: 'saved', ok: true });
+        this.sendInit();
         vscode.window.showInformationMessage(`Settings saved for ${this.repo.owner}/${this.repo.repo}.`);
     }
 
-    private getHtml(): string {
-        const email = this.repo.email ?? {};
-        const recipients = email.recipients?.join(', ') ?? '';
-        const smtpHost = email.smtp?.host ?? '';
-        const smtpPort = email.smtp?.port ?? '';
-        const smtpSecure = email.smtp?.secure ?? false;
-        const smtpUser = email.smtp?.user ?? '';
+    private matches(entry: unknown): boolean {
+        if (typeof entry !== 'string' && !isRecord(entry)) { return false; }
+        const p = parseRepoEntry(entry);
+        return !!p && formatRepoString(p) === this.repoKey;
+    }
+}
 
-        return /* html */ `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <style>
-        body {
-            font-family: var(--vscode-font-family);
-            font-size: var(--vscode-font-size);
-            color: var(--vscode-foreground);
-            background: var(--vscode-editor-background);
-            padding: 20px 28px;
-            max-width: 680px;
-        }
-        h1 {
-            font-size: 1.4em;
-            font-weight: 600;
-            margin: 0 0 4px 0;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        .subtitle {
-            color: var(--vscode-descriptionForeground);
-            margin: 0 0 24px 0;
-            font-size: 0.9em;
-        }
-        .section {
-            margin-bottom: 24px;
-        }
-        .section-title {
-            font-size: 1.05em;
-            font-weight: 600;
-            margin-bottom: 12px;
-            padding-bottom: 4px;
-            border-bottom: 1px solid var(--vscode-widget-border);
-        }
-        label {
-            display: block;
-            font-weight: 500;
-            margin-bottom: 4px;
-            margin-top: 12px;
-        }
-        label:first-child {
-            margin-top: 0;
-        }
-        .help {
-            color: var(--vscode-descriptionForeground);
-            font-size: 0.85em;
-            margin: 2px 0 0 0;
-        }
-        input[type="text"],
-        input[type="number"] {
-            width: 100%;
-            box-sizing: border-box;
-            padding: 6px 8px;
-            border: 1px solid var(--vscode-input-border);
-            background: var(--vscode-input-background);
-            color: var(--vscode-input-foreground);
-            border-radius: 2px;
-            font-family: inherit;
-            font-size: inherit;
-        }
-        input:focus {
-            outline: 1px solid var(--vscode-focusBorder);
-            border-color: var(--vscode-focusBorder);
-        }
-        .checkbox-row {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 12px;
-        }
-        .checkbox-row input[type="checkbox"] {
-            accent-color: var(--vscode-checkbox-background);
-        }
-        .btn-row {
-            display: flex;
-            gap: 8px;
-            margin-top: 28px;
-        }
-        button {
-            padding: 6px 16px;
-            border: none;
-            border-radius: 2px;
-            font-family: inherit;
-            font-size: inherit;
-            cursor: pointer;
-        }
-        .btn-primary {
-            background: var(--vscode-button-background);
-            color: var(--vscode-button-foreground);
-        }
-        .btn-primary:hover {
-            background: var(--vscode-button-hoverBackground);
-        }
-        .btn-secondary {
-            background: var(--vscode-button-secondaryBackground);
-            color: var(--vscode-button-secondaryForeground);
-        }
-        .btn-secondary:hover {
-            background: var(--vscode-button-secondaryHoverBackground);
-        }
-        .row-2col {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-        }
-    </style>
-</head>
-<body>
-    <h1>⚙️ ${this.repo.owner}/${this.repo.repo}</h1>
-    <p class="subtitle">${this.repo.forge} repository</p>
+/** Validate the untrusted form payload. */
+function parseForm(raw: unknown): { form: RepoEmailForm } | { errors: Record<string, string> } {
+    if (!isRecord(raw)) { return { errors: { _form: 'Malformed save request.' } }; }
+    const errors: Record<string, string> = {};
+    const str = (k: string, max: number, check: (v: string) => string | undefined): string => {
+        const v = raw[k];
+        if (typeof v !== 'string') { errors[k] = 'Expected text.'; return ''; }
+        const t = v.trim();
+        if (t.length > max) { errors[k] = `At most ${max} characters.`; return ''; }
+        const e = check(t);
+        if (e) { errors[k] = e; }
+        return t;
+    };
 
-    <div class="section">
-        <div class="section-title">Email Notifications</div>
-        <label for="recipients">Recipients</label>
-        <input type="text" id="recipients" value="${this.escHtml(recipients)}"
-               placeholder="john@example.com, jane@example.com" />
-        <p class="help">Comma-separated. Leave blank to use the global default recipients.</p>
-    </div>
-
-    <div class="section">
-        <div class="section-title">SMTP Override <span style="font-weight:normal; color:var(--vscode-descriptionForeground)">(optional)</span></div>
-        <p class="help" style="margin-bottom:8px">Only fill these in if this repo should send email through a different SMTP server. Otherwise, the global Argus SMTP is used.</p>
-
-        <div class="row-2col">
-            <div>
-                <label for="smtpHost">SMTP Host</label>
-                <input type="text" id="smtpHost" value="${this.escHtml(smtpHost)}" placeholder="smtp.example.com" />
-            </div>
-            <div>
-                <label for="smtpPort">Port</label>
-                <input type="number" id="smtpPort" value="${smtpPort}" placeholder="587" />
-            </div>
-        </div>
-
-        <label for="smtpUser">SMTP User</label>
-        <input type="text" id="smtpUser" value="${this.escHtml(smtpUser)}" placeholder="alerts@example.com" />
-
-        <div class="checkbox-row">
-            <input type="checkbox" id="smtpSecure" ${smtpSecure ? 'checked' : ''} />
-            <label for="smtpSecure" style="margin:0">Use SSL (port 465)</label>
-        </div>
-    </div>
-
-    <div class="btn-row">
-        <button class="btn-primary" onclick="save()">Save</button>
-        <button class="btn-secondary" onclick="cancel()">Cancel</button>
-    </div>
-
-    <script>
-        const vscode = acquireVsCodeApi();
-
-        function save() {
-            const recipientsRaw = document.getElementById('recipients').value.trim();
-            const recipients = recipientsRaw
-                ? recipientsRaw.split(',').map(s => s.trim()).filter(Boolean)
-                : [];
-
-            vscode.postMessage({
-                command: 'save',
-                data: {
-                    recipients,
-                    smtpHost: document.getElementById('smtpHost').value.trim(),
-                    smtpPort: document.getElementById('smtpPort').value.trim(),
-                    smtpSecure: document.getElementById('smtpSecure').checked,
-                    smtpUser: document.getElementById('smtpUser').value.trim(),
-                },
-            });
+    const recipients: string[] = [];
+    if (!Array.isArray(raw.recipients) || raw.recipients.length > MAX_RECIPIENTS) {
+        errors.recipients = `Expected up to ${MAX_RECIPIENTS} addresses.`;
+    } else {
+        for (const r of raw.recipients) {
+            const t = typeof r === 'string' ? r.trim() : '';
+            if (!t) { continue; }
+            const e = t.length > 320 ? 'Address too long.' : checks.email(t);
+            if (e) { errors.recipients = `${t.slice(0, 60)}: ${e}`; break; }
+            if (!recipients.includes(t)) { recipients.push(t); }
         }
-
-        function cancel() {
-            vscode.postMessage({ command: 'cancel' });
-        }
-
-        // Allow Ctrl+S to save
-        document.addEventListener('keydown', (e) => {
-            if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-                e.preventDefault();
-                save();
-            }
-        });
-    </script>
-</body>
-</html>`;
     }
 
-    private escHtml(s: string): string {
-        return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const smtpHost = str('smtpHost', 253, checks.host);
+    const smtpUser = str('smtpUser', 320, checks.noControl);
+    let smtpPort: number | null = null;
+    if (raw.smtpPort !== null) {
+        if (typeof raw.smtpPort !== 'number' || !Number.isInteger(raw.smtpPort) || raw.smtpPort < 1 || raw.smtpPort > 65535) {
+            errors.smtpPort = 'Port must be a whole number from 1 to 65535.';
+        } else {
+            smtpPort = raw.smtpPort;
+        }
     }
+    if (typeof raw.smtpSecure !== 'boolean') { errors.smtpSecure = 'Expected true/false.'; }
+
+    if (Object.keys(errors).length) { return { errors }; }
+    return { form: { recipients, smtpHost, smtpPort, smtpSecure: raw.smtpSecure === true, smtpUser } };
+}
+
+/**
+ * Return `entry` with its email overrides replaced by `form`, keeping the
+ * original repo string (so a self-hosted URL isn't canonicalized away) and
+ * any other keys. Collapses back to a plain string when nothing else is set.
+ */
+function withEmail(entry: RawRepoEntry, form: RepoEmailForm): RawRepoEntry {
+    const base: Record<string, unknown> = typeof entry === 'string' ? { repo: entry } : { ...entry };
+    const email: Record<string, unknown> = isRecord(base.email) ? { ...base.email } : {};
+    delete email.recipients;
+    delete email.smtp;
+
+    if (form.recipients.length) { email.recipients = form.recipients; }
+    const smtp: Record<string, unknown> = {};
+    if (form.smtpHost) { smtp.host = form.smtpHost; }
+    if (form.smtpPort !== null) { smtp.port = form.smtpPort; }
+    if (form.smtpUser) { smtp.user = form.smtpUser; }
+    if (Object.keys(smtp).length || form.smtpSecure) { smtp.secure = form.smtpSecure; }
+    if (Object.keys(smtp).length) { email.smtp = smtp; }
+
+    if (Object.keys(email).length) { base.email = email; } else { delete base.email; }
+    const keys = Object.keys(base);
+    if (keys.length === 1 && keys[0] === 'repo' && typeof base.repo === 'string') { return base.repo; }
+    return base;
 }

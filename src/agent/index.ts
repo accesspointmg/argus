@@ -1,6 +1,8 @@
 // Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
-export { Pipeline, type PipelineConfig } from './pipeline';
+export { RepoPipeline, type PipelineDeps, type WorkSlots, type CycleResult } from './pipeline';
+export { StateStore, type RepoState } from './state-store';
+export { ArgusController } from './controller';
 export { Evaluator } from './evaluator';
 export { Investigator, type InvestigationResult } from './investigator';
 export { Coder, type CodeChangeSet } from './coder';
@@ -16,7 +18,6 @@ export {
     type CommentEvaluation,
     type PRAnalysis,
     type SynthesisCandidate,
-    type IssueSession,
     type CodingIteration,
     type ActivityEntry,
     type RepoStats,

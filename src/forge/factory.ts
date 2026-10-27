@@ -8,22 +8,34 @@ import * as vscode from 'vscode';
 import type { Forge, RepoConfig, ForgePlatform } from './types';
 import { GitHubForge } from './github';
 import { GitLabForge } from './gitlab';
+import { baseUrlForHost } from './util';
 
 export const GITHUB_TOKEN_KEY = 'argus.githubToken';
 export const GITLAB_TOKEN_KEY = 'argus.gitlabToken';
 
 /**
- * Return the secret-storage key for a given platform.
+ * Secret-storage key for a platform, scoped by host for self-hosted instances so a
+ * github.com/gitlab.com token is never sent to another server.
  */
-export function tokenKeyForPlatform(platform: ForgePlatform): string {
-    return platform === 'gitlab' ? GITLAB_TOKEN_KEY : GITHUB_TOKEN_KEY;
+export function tokenKeyForPlatform(platform: ForgePlatform, host?: string): string {
+    const base = platform === 'gitlab' ? GITLAB_TOKEN_KEY : GITHUB_TOKEN_KEY;
+    const h = normalizeHostKey(platform, host);
+    return h ? `${base}:${h}` : base;
+}
+
+/** Lower-cased host without scheme/trailing slash; undefined for the public SaaS host. */
+function normalizeHostKey(platform: ForgePlatform, host?: string): string | undefined {
+    const h = host?.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '').toLowerCase();
+    if (!h) { return undefined; }
+    const saas = platform === 'gitlab' ? ['gitlab.com'] : ['github.com', 'api.github.com'];
+    return saas.includes(h) ? undefined : h;
 }
 
 /**
- * Check whether a token exists for the given platform.
+ * Check whether a token exists for the given platform (and self-hosted host).
  */
-export async function hasToken(platform: ForgePlatform, secrets: vscode.SecretStorage): Promise<boolean> {
-    const val = await secrets.get(tokenKeyForPlatform(platform));
+export async function hasToken(platform: ForgePlatform, secrets: vscode.SecretStorage, host?: string): Promise<boolean> {
+    const val = await secrets.get(tokenKeyForPlatform(platform, host));
     return !!val;
 }
 
@@ -33,28 +45,33 @@ export async function hasToken(platform: ForgePlatform, secrets: vscode.SecretSt
 export async function promptAndStoreToken(
     platform: ForgePlatform,
     secrets: vscode.SecretStorage,
+    host?: string,
 ): Promise<string | undefined> {
-    const label = platform === 'gitlab' ? 'GitLab' : 'GitHub';
-    const placeholder = platform === 'gitlab' ? 'glpat-...' : 'ghp_...';
+    const hostKey = normalizeHostKey(platform, host);
+    const label = (platform === 'gitlab' ? 'GitLab' : 'GitHub') + (hostKey ? ` (${hostKey})` : '');
+    const placeholder = platform === 'gitlab' ? 'glpat-...' : 'github_pat_...';
+    const prompt = platform === 'gitlab'
+        ? `Enter a ${label} access token for Argus (scope: api). Prefer a project access token with Developer role.`
+        : `Enter a ${label} fine-grained token for Argus, limited to monitored repos (Contents, Issues, Pull requests, Commit statuses: read & write).`;
 
     const entered = await vscode.window.showInputBox({
         title: `Set ${label} Token`,
-        prompt: `Enter your ${label} Personal Access Token for Argus (scopes: repo, read:user)`,
+        prompt,
         password: true,
         placeHolder: placeholder,
         validateInput: (v) => v.trim() ? undefined : 'Token cannot be empty',
     });
     if (!entered) { return undefined; }
 
-    await secrets.store(tokenKeyForPlatform(platform), entered.trim());
+    await secrets.store(tokenKeyForPlatform(platform, host), entered.trim());
     return entered.trim();
 }
 
 /**
  * Delete a stored token for the given platform.
  */
-export async function clearToken(platform: ForgePlatform, secrets: vscode.SecretStorage): Promise<void> {
-    await secrets.delete(tokenKeyForPlatform(platform));
+export async function clearToken(platform: ForgePlatform, secrets: vscode.SecretStorage, host?: string): Promise<void> {
+    await secrets.delete(tokenKeyForPlatform(platform, host));
 }
 
 /**
@@ -65,22 +82,25 @@ export async function createForge(
     config: RepoConfig,
     secrets: vscode.SecretStorage,
 ): Promise<Forge> {
-    const key = tokenKeyForPlatform(config.forge);
+    // Validate the host before any token is read for it.
+    const baseUrl = baseUrlForHost(config.forge, config.host);
+    const key = tokenKeyForPlatform(config.forge, config.host);
     let token = await secrets.get(key);
 
     if (!token) {
-        token = await promptAndStoreToken(config.forge, secrets);
+        token = await promptAndStoreToken(config.forge, secrets, config.host);
         if (!token) {
             const label = config.forge === 'gitlab' ? 'GitLab' : 'GitHub';
             throw new Error(`${label} token is required. Run "Argus: Set ${label} Token" first.`);
         }
     }
 
+    // `host` selects GitHub Enterprise / self-hosted GitLab; https only.
     switch (config.forge) {
         case 'github':
-            return new GitHubForge(config.owner, config.repo, token);
+            return new GitHubForge(config.owner, config.repo, token, baseUrl);
         case 'gitlab':
-            return new GitLabForge(config.owner, config.repo, token);
+            return new GitLabForge(config.owner, config.repo, token, baseUrl);
         default:
             throw new Error(`Unsupported forge platform: ${config.forge}`);
     }

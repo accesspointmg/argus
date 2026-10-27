@@ -10,3 +10,5 @@ export * from './types';
 export { LlmService, readAiSettings, apiKeyStorageKey, providerNeedsKey } from './service';
 export type { AiSettings } from './service';
 export { LlmThrottle } from './throttle';
+export { parseModelJson, ModelOutputError } from './json';
+export type { ParseModelJsonOptions, ModelOutputFailure } from './json';

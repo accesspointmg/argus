@@ -9,154 +9,200 @@
  *  3. Repo Stats     — per-repo metrics
  *  4. Security       — threat detections & trust info
  *  5. System Health  — polling status, LLM availability, key rotation
+ *
+ * Issue titles and activity messages are attacker-controlled. Tooltips add
+ * them with `appendText` (escaped markdown), and only http(s) URLs become
+ * click targets.
  */
 
 import * as vscode from 'vscode';
-import type { Pipeline } from '../agent/pipeline';
 import type { TrackedIssue, ActivityEntry, RepoStats, IssueState } from '../agent/types';
-import type { AuditLog } from '../crypto/audit';
 
-// ─── State → Icon mapping ───────────────────────────────────────────
+// ─── Data sources (narrow, so the pipeline can change shape) ────────
 
-const STATE_ICONS: Record<IssueState, string> = {
-    pending: '$(clock)',
-    evaluating: '$(search)',
-    approved: '$(check)',
-    rejected: '$(x)',
-    branching: '$(git-branch)',
-    coding: '$(code)',
-    'waiting-ci': '$(loading~spin)',
-    iterating: '$(sync~spin)',
-    'pr-open': '$(git-pull-request)',
-    'analyzing-competing': '$(diff)',
-    synthesizing: '$(beaker)',
-    stuck: '$(warning)',
-    flagged: '$(shield)',
-    done: '$(pass-filled)',
-    skipped: '$(circle-slash)',
-};
+/** Where the Work Queue view gets its items (all repos). */
+export interface WorkQueueSource {
+    getQueue(): readonly TrackedIssue[];
+}
+
+/** Where the Activity view gets its items, oldest first. */
+export interface ActivitySource {
+    getActivity(limit?: number): readonly ActivityEntry[];
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
+
+/** Dates may arrive as strings/numbers once state is persisted as JSON. */
+function toTime(d: Date | string | number | undefined): number {
+    if (d === undefined) { return 0; }
+    const t = d instanceof Date ? d.getTime() : new Date(d).getTime();
+    return Number.isFinite(t) ? t : 0;
+}
+
+function webUri(url: string | undefined): vscode.Uri | undefined {
+    if (!url) { return undefined; }
+    try {
+        const u = vscode.Uri.parse(url, true);
+        return u.scheme === 'https' || u.scheme === 'http' ? u : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function openCommand(uri: vscode.Uri | undefined, title: string): vscode.Command | undefined {
+    return uri ? { command: 'vscode.open', title, arguments: [uri] } : undefined;
+}
+
+function oneLine(s: string, max = 200): string {
+    const t = s.replace(/\s+/g, ' ').trim();
+    return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+abstract class RefreshableProvider<T> implements vscode.TreeDataProvider<T>, vscode.Disposable {
+    protected readonly changed = new vscode.EventEmitter<T | undefined>();
+    readonly onDidChangeTreeData = this.changed.event;
+
+    refresh(): void {
+        this.changed.fire(undefined);
+    }
+
+    dispose(): void {
+        this.changed.dispose();
+    }
+
+    abstract getTreeItem(element: T): vscode.TreeItem;
+    abstract getChildren(element?: T): T[];
+}
 
 // ─── Work Queue ─────────────────────────────────────────────────────
 
-export class WorkQueueProvider implements vscode.TreeDataProvider<TrackedIssue> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<TrackedIssue | undefined>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+/** Codicon per state. */
+const STATE_ICONS: Record<IssueState, string> = {
+    pending: 'clock',
+    evaluating: 'search',
+    'awaiting-approval': 'account',
+    approved: 'check',
+    rejected: 'x',
+    branching: 'git-branch',
+    coding: 'code',
+    'waiting-ci': 'loading~spin',
+    iterating: 'sync~spin',
+    'pr-open': 'git-pull-request',
+    'analyzing-competing': 'diff',
+    synthesizing: 'beaker',
+    stuck: 'warning',
+    flagged: 'shield',
+    done: 'pass-filled',
+    skipped: 'circle-slash',
+};
 
-    constructor(private readonly pipeline: Pipeline) {}
+/** Sort rank: active work first, finished last. */
+const STATE_ORDER: Record<IssueState, number> = {
+    coding: 0, iterating: 0, evaluating: 0, branching: 0,
+    'waiting-ci': 1, 'analyzing-competing': 1, synthesizing: 1,
+    'pr-open': 2, pending: 3, approved: 3, 'awaiting-approval': 3,
+    stuck: 4, flagged: 4,
+    done: 5, rejected: 5, skipped: 5,
+};
 
-    refresh(): void {
-        this._onDidChangeTreeData.fire(undefined);
+export class WorkQueueProvider extends RefreshableProvider<TrackedIssue> {
+    /** Show the repo next to each item when the queue spans several. */
+    private multiRepo = false;
+
+    constructor(private readonly source: WorkQueueSource) {
+        super();
     }
 
     getTreeItem(item: TrackedIssue): vscode.TreeItem {
         const ti = new vscode.TreeItem(
-            `#${item.issueNumber} ${item.title}`,
+            `#${item.issueNumber} ${oneLine(item.title, 120)}`,
             vscode.TreeItemCollapsibleState.None,
         );
-        ti.description = item.state;
-        ti.iconPath = new vscode.ThemeIcon(STATE_ICONS[item.state]?.replace('$(', '').replace(')', '') || 'circle-outline');
-        ti.tooltip = new vscode.MarkdownString(
-            `**#${item.issueNumber}** ${item.title}\n\n` +
-            `State: ${item.state}\n` +
-            `Iteration: ${item.currentIteration}/${item.maxIterations}\n` +
-            (item.prUrl ? `PR: [#${item.prNumber}](${item.prUrl})\n` : '') +
-            (item.error ? `\n⚠️ ${item.error}` : '')
-        );
-        if (item.url) {
-            ti.command = {
-                command: 'vscode.open',
-                title: 'Open Issue',
-                arguments: [vscode.Uri.parse(item.url)],
-            };
+        ti.description = this.multiRepo ? `${item.state} · ${item.repo}` : item.state;
+        ti.iconPath = new vscode.ThemeIcon(STATE_ICONS[item.state] ?? 'circle-outline');
+
+        // supportThemeIcons up front so appendText also escapes `$(icon)` in titles.
+        const md = new vscode.MarkdownString(undefined, true);
+        md.appendMarkdown(`**#${item.issueNumber}** `);
+        md.appendText(oneLine(item.title, 300));
+        md.appendMarkdown('\n\n');
+        md.appendText(`Repo: ${item.repo}\nState: ${item.state}\nIteration: ${item.currentIteration}/${item.maxIterations}\n`);
+        if (item.prNumber !== undefined) {
+            md.appendText(`PR: #${item.prNumber}${item.prUrl ? ` ${item.prUrl}` : ''}\n`);
         }
+        if (item.error) {
+            md.appendMarkdown('\n\n$(warning) ');
+            md.appendText(oneLine(item.error, 500));
+        }
+        ti.tooltip = md;
+
+        ti.command = openCommand(webUri(item.url), 'Open Issue');
         ti.contextValue = `argus.issue.${item.state}`;
         return ti;
     }
 
     getChildren(): TrackedIssue[] {
-        return [...this.pipeline.getWorkQueue()].sort((a, b) => {
-            // Active items first, then by creation date
-            const stateOrder: Record<string, number> = {
-                coding: 0, iterating: 0, evaluating: 0, branching: 0,
-                'waiting-ci': 1, 'analyzing-competing': 1, synthesizing: 1,
-                'pr-open': 2, pending: 3, approved: 3,
-                stuck: 4, flagged: 4,
-                done: 5, rejected: 5, skipped: 5,
-            };
-            const aOrder = stateOrder[a.state] ?? 3;
-            const bOrder = stateOrder[b.state] ?? 3;
+        const queue = this.source.getQueue();
+        this.multiRepo = new Set(queue.map((i) => i.repo)).size > 1;
+        return [...queue].sort((a, b) => {
+            const aOrder = STATE_ORDER[a.state] ?? 3;
+            const bOrder = STATE_ORDER[b.state] ?? 3;
             if (aOrder !== bOrder) { return aOrder - bOrder; }
-            return b.createdAt.getTime() - a.createdAt.getTime();
+            return toTime(b.createdAt) - toTime(a.createdAt);
         });
     }
 }
 
 // ─── Recent Activity ────────────────────────────────────────────────
 
-export class ActivityProvider implements vscode.TreeDataProvider<ActivityEntry> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<ActivityEntry | undefined>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+const ACTIVITY_LIMIT = 50;
 
-    constructor(private readonly pipeline: Pipeline) {}
-
-    refresh(): void {
-        this._onDidChangeTreeData.fire(undefined);
+export class ActivityProvider extends RefreshableProvider<ActivityEntry> {
+    constructor(private readonly source: ActivitySource) {
+        super();
     }
 
     getTreeItem(entry: ActivityEntry): vscode.TreeItem {
-        const timeAgo = this.formatTimeAgo(entry.timestamp);
+        const when = toTime(entry.timestamp);
         const ti = new vscode.TreeItem(
-            `${entry.icon} ${entry.message}`,
+            `${entry.icon} ${oneLine(entry.message, 150)}`,
             vscode.TreeItemCollapsibleState.None,
         );
-        ti.description = timeAgo;
-        ti.tooltip = new vscode.MarkdownString(
-            `${entry.icon} ${entry.message}\n\n` +
-            `Repo: ${entry.repo}\n` +
-            `Time: ${entry.timestamp.toLocaleString()}\n` +
-            (entry.url ? `[Open](${entry.url})` : '')
-        );
-        if (entry.url) {
-            ti.command = {
-                command: 'vscode.open',
-                title: 'Open',
-                arguments: [vscode.Uri.parse(entry.url)],
-            };
-        }
+        ti.description = formatTimeAgo(when);
+        const md = new vscode.MarkdownString(undefined, true);
+        md.appendText(`${entry.icon} ${oneLine(entry.message, 500)}\n\nRepo: ${entry.repo}\nTime: ${new Date(when).toLocaleString()}`);
+        ti.tooltip = md;
+        ti.command = openCommand(webUri(entry.url), 'Open');
         return ti;
     }
 
     getChildren(): ActivityEntry[] {
-        return [...this.pipeline.getActivity(50)].reverse();
+        return [...this.source.getActivity(ACTIVITY_LIMIT)].reverse();
     }
+}
 
-    private formatTimeAgo(date: Date): string {
-        const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-        if (seconds < 60) { return `${seconds}s ago`; }
-        const minutes = Math.floor(seconds / 60);
-        if (minutes < 60) { return `${minutes}m ago`; }
-        const hours = Math.floor(minutes / 60);
-        if (hours < 24) { return `${hours}h ago`; }
-        return `${Math.floor(hours / 24)}d ago`;
-    }
+function formatTimeAgo(time: number): string {
+    if (!time) { return ''; }
+    const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+    if (seconds < 60) { return `${seconds}s ago`; }
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) { return `${minutes}m ago`; }
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) { return `${hours}h ago`; }
+    return `${Math.floor(hours / 24)}d ago`;
 }
 
 // ─── Repository Stats ───────────────────────────────────────────────
 
-interface StatsItem {
+export interface StatsItem {
     label: string;
     value: string;
     repo?: string;
+    children?: StatsItem[];
 }
 
-export class RepoStatsProvider implements vscode.TreeDataProvider<StatsItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<StatsItem | undefined>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+export class RepoStatsProvider extends RefreshableProvider<StatsItem> {
     private stats: RepoStats[] = [];
-
-    refresh(): void {
-        this._onDidChangeTreeData.fire(undefined);
-    }
 
     updateStats(stats: RepoStats[]): void {
         this.stats = stats;
@@ -164,65 +210,63 @@ export class RepoStatsProvider implements vscode.TreeDataProvider<StatsItem> {
     }
 
     getTreeItem(item: StatsItem): vscode.TreeItem {
-        const ti = new vscode.TreeItem(item.label, vscode.TreeItemCollapsibleState.None);
+        const ti = new vscode.TreeItem(
+            item.label,
+            item.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None,
+        );
         ti.description = item.value;
-        if (item.repo) {
-            ti.tooltip = `Repository: ${item.repo}`;
-        }
+        if (item.children) { ti.iconPath = new vscode.ThemeIcon('repo'); }
+        if (item.repo) { ti.tooltip = `Repository: ${item.repo}`; }
         return ti;
     }
 
-    getChildren(): StatsItem[] {
+    getChildren(element?: StatsItem): StatsItem[] {
+        if (element) { return element.children ?? []; }
         if (this.stats.length === 0) {
             return [{ label: 'No repositories configured', value: '' }];
         }
-        const items: StatsItem[] = [];
-        for (const stat of this.stats) {
-            items.push({ label: `📦 ${stat.repo}`, value: '', repo: stat.repo });
-            items.push({ label: '  Issues triaged', value: String(stat.argusTriaged), repo: stat.repo });
-            items.push({ label: '  PRs opened', value: String(stat.prsOpened), repo: stat.repo });
-            items.push({ label: '  PRs merged (human)', value: String(stat.prsMergedByHumans), repo: stat.repo });
-            items.push({ label: '  Rejection rate', value: `${(stat.rejectionRate * 100).toFixed(0)}%`, repo: stat.repo });
-            items.push({ label: '  Threat detections', value: String(stat.threatDetections), repo: stat.repo });
-        }
-        return items;
+        return this.stats.map((s) => ({
+            label: s.repo,
+            value: '',
+            repo: s.repo,
+            children: [
+                { label: 'Issues triaged', value: String(s.argusTriaged), repo: s.repo },
+                { label: 'PRs opened', value: String(s.prsOpened), repo: s.repo },
+                { label: 'PRs merged (human)', value: String(s.prsMergedByHumans), repo: s.repo },
+                { label: 'Rejection rate', value: `${(s.rejectionRate * 100).toFixed(0)}%`, repo: s.repo },
+                { label: 'Threat detections', value: String(s.threatDetections), repo: s.repo },
+            ],
+        }));
     }
 }
 
 // ─── Security Monitor ───────────────────────────────────────────────
 
-interface SecurityItem {
+export type Severity = 'info' | 'warn' | 'error';
+
+export interface SecurityItem {
     label: string;
     detail: string;
-    severity?: 'info' | 'warn' | 'error';
+    severity?: Severity;
 }
 
-export class SecurityProvider implements vscode.TreeDataProvider<SecurityItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<SecurityItem | undefined>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+const MAX_SECURITY_ITEMS = 100;
+
+export class SecurityProvider extends RefreshableProvider<SecurityItem> {
     private items: SecurityItem[] = [];
 
-    refresh(): void {
-        this._onDidChangeTreeData.fire(undefined);
-    }
-
-    addThreatEvent(label: string, detail: string, severity: 'info' | 'warn' | 'error'): void {
-        this.items.unshift({ label, detail, severity });
-        if (this.items.length > 100) { this.items = this.items.slice(0, 100); }
+    addThreatEvent(label: string, detail: string, severity: Severity): void {
+        this.items.unshift({ label: oneLine(label, 150), detail: oneLine(detail, 200), severity });
+        if (this.items.length > MAX_SECURITY_ITEMS) { this.items.length = MAX_SECURITY_ITEMS; }
         this.refresh();
     }
 
     getTreeItem(item: SecurityItem): vscode.TreeItem {
-        const icon = item.severity === 'error' ? '$(error)' :
-                     item.severity === 'warn' ? '$(warning)' : '$(info)';
-        const ti = new vscode.TreeItem(
-            `${icon.replace('$(', '').replace(')', '')} ${item.label}`,
-            vscode.TreeItemCollapsibleState.None,
-        );
+        const ti = new vscode.TreeItem(item.label, vscode.TreeItemCollapsibleState.None);
         ti.description = item.detail;
+        ti.tooltip = item.detail ? `${item.label}\n${item.detail}` : item.label;
         ti.iconPath = new vscode.ThemeIcon(
-            item.severity === 'error' ? 'error' :
-            item.severity === 'warn' ? 'warning' : 'info',
+            item.severity === 'error' ? 'error' : item.severity === 'warn' ? 'warning' : 'info',
         );
         return ti;
     }
@@ -237,20 +281,14 @@ export class SecurityProvider implements vscode.TreeDataProvider<SecurityItem> {
 
 // ─── System Health ──────────────────────────────────────────────────
 
-interface HealthItem {
+export interface HealthItem {
     label: string;
     value: string;
     status: 'ok' | 'warning' | 'error';
 }
 
-export class SystemHealthProvider implements vscode.TreeDataProvider<HealthItem> {
-    private _onDidChangeTreeData = new vscode.EventEmitter<HealthItem | undefined>();
-    readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+export class SystemHealthProvider extends RefreshableProvider<HealthItem> {
     private items: HealthItem[] = [];
-
-    refresh(): void {
-        this._onDidChangeTreeData.fire(undefined);
-    }
 
     updateHealth(items: HealthItem[]): void {
         this.items = items;
@@ -261,11 +299,11 @@ export class SystemHealthProvider implements vscode.TreeDataProvider<HealthItem>
         const ti = new vscode.TreeItem(item.label, vscode.TreeItemCollapsibleState.None);
         ti.description = item.value;
         ti.iconPath = new vscode.ThemeIcon(
-            item.status === 'ok' ? 'pass' :
-            item.status === 'warning' ? 'warning' : 'error',
-            item.status === 'ok' ? new vscode.ThemeColor('testing.iconPassed') :
-            item.status === 'warning' ? new vscode.ThemeColor('testing.iconQueued') :
-            new vscode.ThemeColor('testing.iconFailed'),
+            item.status === 'ok' ? 'pass' : item.status === 'warning' ? 'warning' : 'error',
+            new vscode.ThemeColor(
+                item.status === 'ok' ? 'testing.iconPassed' :
+                item.status === 'warning' ? 'testing.iconQueued' : 'testing.iconFailed',
+            ),
         );
         return ti;
     }

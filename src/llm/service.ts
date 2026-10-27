@@ -25,6 +25,14 @@ import { AnthropicProvider } from './providers/anthropic';
 import { OpenAiProvider } from './providers/openai';
 import { GeminiProvider } from './providers/gemini';
 import { OllamaProvider } from './providers/ollama';
+import { ClaudeCodeProvider } from './providers/claude-code';
+
+/** Marketplace id of the Claude Code extension, whose bundled CLI the claude-code provider runs. */
+const CLAUDE_CODE_EXTENSION_ID = 'anthropic.claude-code';
+
+function claudeCodeExtensionPath(): string | undefined {
+    return vscode.extensions.getExtension(CLAUDE_CODE_EXTENSION_ID)?.extensionPath;
+}
 
 /**
  * Default reply ceiling.
@@ -57,6 +65,8 @@ export interface AiSettings {
     callsPerHour: number;
     /** Undefined means "use the model default". */
     effort?: EffortLevel;
+    /** `argus.ai.claudePath`: explicit Claude Code CLI path; empty means auto-detect. */
+    claudePath: string;
 }
 
 export function readAiSettings(): AiSettings {
@@ -74,6 +84,7 @@ export function readAiSettings(): AiSettings {
         maxTokens: cfg.get<number>('ai.maxTokens', DEFAULT_MAX_TOKENS),
         callsPerHour: cfg.get<number>('rateLimits.llmCallsPerHour', DEFAULT_CALLS_PER_HOUR),
         effort: readEffort(cfg.get<string>('ai.effort', 'default')),
+        claudePath: (cfg.get<string>('ai.claudePath', '') || '').trim(),
     };
 }
 
@@ -117,6 +128,7 @@ export class LlmService {
             settings.vendor,
             settings.maxTokens,
             settings.effort ?? null,
+            settings.claudePath,
             apiKey ? 'keyed' : 'unkeyed',
         ]);
 
@@ -173,6 +185,23 @@ export class LlmService {
         return provider.chat(request);
     }
 
+    /**
+     * Strings the outbound redactor must scrub (e.g. the Claude account email
+     * the claude-code provider's CLI puts in the model's context). Checks the
+     * provider's account first so the list is populated; never throws.
+     */
+    async sensitiveStrings(): Promise<string[]> {
+        try {
+            const provider = await this.provider();
+            if (!provider.sensitiveStrings) { return []; }
+            await provider.isAvailable();
+            return provider.sensitiveStrings();
+        } catch (err) {
+            this.logger.debug(`Could not collect sensitive strings: ${err}`);
+            return [];
+        }
+    }
+
     /** Provider and model, for logs and audit entries. Never includes a key. */
     async describe(): Promise<string> {
         try {
@@ -216,6 +245,14 @@ export function createProvider(settings: AiSettings, apiKey: string): LlmProvide
             return new VsCodeLmProvider({
                 vendor: settings.vendor || 'copilot',
                 family: settings.model || undefined,
+            });
+
+        case 'claude-code':
+            return new ClaudeCodeProvider({
+                model: settings.model,
+                effort: settings.effort,
+                claudePath: settings.claudePath,
+                extensionPath: claudeCodeExtensionPath,
             });
 
         case 'anthropic':

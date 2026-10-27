@@ -15,8 +15,15 @@ export type {
     RepoRole,
     UserHistory,
     TreeEntry,
+    CommitFile,
+    TokenValidation,
+    ReviewComment,
 } from './types';
-export { repoKey } from './types';
+export { repoKey, MAX_LIST_ITEMS } from './types';
+export { UnsupportedError, HaltedError, ForgeRateLimitError, ForgeHttpError } from './errors';
+export type { WriteKind } from './errors';
+export { GuardedForge, HourlyWriteLimiter } from './guarded';
+export type { WriteLimiter, WriteLimit, GuardedForgeOptions } from './guarded';
 export { GitHubForge } from './github';
 export { GitLabForge } from './gitlab';
 export { createForge } from './factory';

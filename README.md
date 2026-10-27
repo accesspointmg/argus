@@ -2,132 +2,115 @@
 
 > *The hundred-eyed watchman that never sleeps.*
 
-A VS Code extension that autonomously triages GitHub/GitLab issues, investigates code, creates branches, and opens pull requests with full AI reasoning transcripts. Adversary-aware. Cryptographically stamped. Never merges.
+A VS Code extension that watches GitHub and GitLab repositories, triages new issues with an AI model, and — for issues a trusted person asks it to fix — writes the change, runs it through CI and opens a pull request with its full reasoning. It also posts a threat-assessment commit status on every open PR that branch protection can use as a merge gate.
 
-## Features
+Argus never merges. A human always reviews and merges.
 
-- **Issue Triage** — Polls repos for new issues, evaluates technical merit with the AI provider of your choice
-- **Agentic Evaluation** — Multi-turn LLM exploration of the full codebase via READ_FILES protocol before rendering judgment
-- **Code Investigation** — Reads relevant source files, searches for error patterns, builds context
-- **Autonomous Coding** — Creates branches, iterates on fixes, monitors CI results
-- **Pull Request Management** — Opens PRs with detailed reasoning transcripts as comments
-- **Issue Acknowledgment** — Posts stamped comments on issues linking to the PR, with category/severity/approach
-- **Comment Monitoring** — Watches for new issue comments, runs moderation, logs clean feedback on the PR
-- **PR Review Feedback** — Reads and acknowledges inline review comments (e.g., from GitHub Copilot, human reviewers)
-- **Competitive PR Analysis** — Evaluates competing PRs, ranks solutions, synthesizes super PRs
-- **Smart Skip Logic** — Avoids re-processing issues where Argus already has the last word
-- **Confidence Safety Net** — Low-confidence rejections auto-flip to accepted for investigation
-- **12-Layer Security** — Input sanitization, cryptographic LLM framing, threat classification, session isolation, output validation, HMAC stamps, tamper detection, scope-locked tokens, rate limiting, chained audit log, watchdog timers, multi-instance sovereignty
-- **Graduated Trust Model** — Role-aware, history-informed user trust with proportional response
-- **Multi-Forge** — GitHub and GitLab from a single abstraction
-- **Token Management** — Set, clear, and list authentication tokens from the command palette
-- **Email Notifications** — Configurable per-event with SMTP support
-- **Cryptographic Identity** — HMAC-SHA256 stamps on every artifact, anti-replay nonces
+## What it does
 
-## Quick Start
+- **Triage** — evaluates each new issue (the model can read files from the repo before deciding) and labels it: merit, rejected, or needs human review.
+- **Fixes, only when a trusted person asks** — code is written only for issues opened by a trusted user, or after a trusted user comments `/argus fix` on the issue. Everyone else gets triage labels and nothing more. See [Trust](#trust).
+- **Contained code changes** — Argus may only modify files it read in full, never touches CI config, manifests, build scripts or hooks, keeps each change under `argus.maxDiffLines`, and commits each iteration atomically. It waits for CI on that exact commit and feeds failures back to the model.
+- **PR transcript** — one comment with the evaluation, investigation and every iteration, in collapsible sections.
+- **Merge gate** — every open PR (Argus's own included) gets an `argus/threat-assessment` commit status from a diff review. If the assessment fails or the model is unavailable, the status is `failure` with "human review required" — it never fails open.
+- **Moderation** — new comments on issues and PRs Argus is working on are classified. Pattern matches alone never delete anything; deletion needs the model's confirmation, and auto-block is off by default.
+- **Competing PRs** — when other PRs address the same issue, Argus ranks them and can post a plan for combining them (it doesn't open the combined PR).
+- **Email** — optional notifications per event, with quiet hours.
+- **Signed** — everything Argus posts carries an HMAC stamp, so it can recognize its own comments and ignore forged ones. Actions go to a hash-chained audit log.
 
-1. Install the extension
-2. Open the command palette and run **Argus: Set GitHub Token** (or GitLab)
-3. Run **Argus: Select AI Provider** and pick the model Argus should think with
-4. Add repos via **Argus: Add Repository** or configure `argus.repos` in settings
-5. Click **Start** in the Argus sidebar panel
+## Quick start
 
-### Choosing an AI Provider
+1. Install the extension.
+2. **Argus: Set GitHub Token** (or GitLab).
+3. **Argus: Select AI Provider** and choose a model (see below).
+4. **Argus: Add Repository**.
+5. Turn on `argus.dryRun` for a first look, then **Argus: Start** from the sidebar.
 
-Argus needs a language model, but it does not care which one. **Argus: Select AI
-Provider** walks through the choice and stores any API key in VS Code's
-SecretStorage (keys are held per provider, so switching back and forth does not
-mean re-entering them).
+## Choosing an AI provider
 
-| Provider | Setting value | Needs a key | Notes |
+| Provider | Setting value | Needs | Notes |
 |---|---|---|---|
-| VS Code / GitHub Copilot | `vscode-lm` | No | The default. Uses any chat model VS Code already provides; set `argus.ai.vendor` to select a non-Copilot one. |
-| Anthropic Claude | `anthropic` | Yes | Adaptive thinking on, with an automatic fallback model when a safety classifier declines a security review. |
-| OpenAI | `openai` | Yes | |
-| Google Gemini | `gemini` | Yes | |
-| Ollama | `ollama` | No | Runs on your machine — nothing leaves the host. Worth considering for private repositories. |
-| Anything OpenAI-compatible | `openai-compatible` | Usually | Groq, Together, OpenRouter, vLLM, LM Studio, a corporate gateway. Point `argus.ai.baseUrl` at it. |
+| **Claude subscription** | `claude-code` | Claude Code installed and signed in | Uses your Claude Pro/Max plan — no API key. See below. |
+| VS Code / GitHub Copilot | `vscode-lm` | A Copilot subscription (or another extension that provides models) | Copilot includes Claude models. |
+| Anthropic API | `anthropic` | API key | Supports `argus.ai.effort`; falls back to another model when a safety classifier declines a security review. |
+| OpenAI | `openai` | API key | |
+| Google Gemini | `gemini` | API key | |
+| Ollama | `ollama` | Local server | Nothing leaves your machine. |
+| OpenAI-compatible | `openai-compatible` | Endpoint (+ key if required) | Groq, OpenRouter, vLLM, LM Studio, a gateway… |
 
-The flow is **provider → endpoint → key → model → effort**, and that order
-matters: the model list is fetched live from the vendor, which can't happen
-before the key exists. You pick from what your key can actually reach — Ollama
-lists what you've pulled, Anthropic and Gemini show context windows — rather
-than typing a model name from memory and finding the typo as a 404 later. If a
-vendor is unreachable or a self-hosted server has no listing route, it falls
-back to a text box.
+API keys are stored in VS Code SecretStorage, one per provider.
 
-`argus.ai.effort` controls how hard the model thinks (`low` … `max`). It's
-honored by the Anthropic provider; the others ignore it rather than guessing at
-an equivalent knob, since sending the wrong one is a 400. Leave it at `default`
-unless you have a reason — and note `xhigh`/`max` are rejected by older models.
+### Claude subscription (`claude-code`)
 
-Two related settings that aren't per-model: `argus.ai.maxTokens` caps a single
-reply (needs headroom — code generation returns whole files), and
-`argus.rateLimits.llmCallsPerHour` bounds spend across all repositories.
+Argus runs the Claude Code CLI that ships with the Claude Code extension (or one on your PATH, or `argus.ai.claudePath`) in headless mode, using your own existing sign-in. Argus never reads, stores or forwards your Claude credentials; run **Argus: Check Claude Code Login** to see whether you're signed in.
 
-Adding a provider means one file under `src/llm/providers/` — nothing outside
-that folder knows which vendors exist.
+Each call runs with all tools disabled, no MCP servers, no settings or CLAUDE.md, no saved session, in an empty temporary folder.
 
-### Required GitHub PAT Permissions (Fine-Grained)
+Things to know:
+
+- **Usage limits are shared** with your interactive Claude Code use. When the limit is hit, Argus pauses that issue and retries on a later poll.
+- **The CLI tells the model your account email and some machine details.** This can't be turned off. Argus removes them from every reply and from everything it posts, but treat it as a reason to prefer `dryRun` until you're comfortable.
+- **Terms of use.** Anthropic allows you to sign in to the unmodified Claude Code CLI with your own subscription. It does not allow third-party products to route other people's requests through subscription credentials. Use this provider for your own repositories, on your own machine.
+
+## Trust
+
+Argus reads text written by strangers, so who asked matters more than what they asked.
+
+A user is **trusted** when they are in `argus.trust.trustedUsers`, or are an owner/member/collaborator of the repository (controlled by `argus.trust.treatMaintainersAsTrusted` / `treatReviewersAsTrusted`). Flags and blocks Argus has recorded against a user count against them.
+
+- Issue opened by a trusted user → Argus may write a fix.
+- Issue opened by anyone else → triage only. A trusted user can comment **`/argus fix`** (or `/argus approve`) to authorize the fix.
+- If the issue is edited after Argus evaluated it, Argus stops before publishing and labels it `subversion-detected`.
+
+## Safety switches
+
+- `argus.dryRun` — nothing is written to GitHub/GitLab at all. Enforced underneath every component, so no code path can skip it.
+- **Stop** — stops polling and aborts work in progress.
+- **Emergency Stop** — the same, and every write stays blocked until you start Argus again.
+- `argus.rateLimits.*` — hourly caps on comments, branches, PRs, pushes, issues and model calls; a daily cap on blocks.
+- `argus.watchdogTimeoutMinutes` — maximum time on one issue.
+- All Argus settings are user-level: a repository's `.vscode/settings.json` can't change them.
+
+## Token permissions (GitHub fine-grained PAT)
 
 | Permission | Access | Why |
 |---|---|---|
-| Contents | Read & Write | Read code, create branches, commit files |
-| Issues | Read & Write | Read issues, add labels, post comments |
-| Pull requests | Read & Write | Create PRs, post review acknowledgments |
-| Commit statuses | Read & Write | Monitor CI results, post threat assessment verdicts |
+| Contents | Read & write | Read code, create branches, commit |
+| Issues | Read & write | Read issues, label, comment |
+| Pull requests | Read & write | Open PRs, comment |
+| Commit statuses | Read & write | Read CI, post the merge-gate status |
+
+Self-hosted GitLab and GitHub Enterprise: add the repo by URL (or set `host` in the `argus.repos` entry). Tokens are stored per host, so a github.com token is never sent elsewhere.
 
 ## Architecture
 
 ```
 src/
-├── extension.ts          # Activation, commands, token management, polling
-├── forge/                # Multi-forge abstraction (GitHub + GitLab)
-│   ├── types.ts          # Forge interface, Issue, Comment, ReviewComment, PR types
-│   ├── github.ts         # GitHub implementation via @octokit/rest
-│   ├── gitlab.ts         # GitLab implementation via REST API v4
-│   └── factory.ts        # Forge creation, token helpers
-├── agent/                # Issue evaluation, coding, PR analysis
-│   ├── evaluator.ts      # Multi-turn agentic evaluation with READ_FILES protocol
-│   ├── investigator.ts   # Code search, file-level analysis
-│   ├── coder.ts          # Iterative LLM code generation + CI loop
-│   ├── pipeline.ts       # Main orchestrator — poll → evaluate → code → PR → monitor
-│   ├── transcriber.ts    # Formats AI reasoning as structured PR comments
-│   ├── comment-handler.ts # Comment moderation with threat assessment
-│   ├── edit-detector.ts  # Detects mid-flight issue edits
-│   └── pr-analyzer.ts    # Competitive PR analysis & synthesis
-├── llm/                  # Provider abstraction — one interface, any vendor
-│   ├── types.ts          # ChatRequest/ChatMessage, LlmProvider, errors
-│   ├── service.ts        # Resolves argus.ai.* settings into a live provider
-│   ├── setup.ts          # "Select AI Provider" / "Set AI Provider Key"
-│   └── providers/        # vscode-lm, anthropic, openai, gemini, ollama
-├── security/             # Sanitization, threat classification, trust model
-├── crypto/               # HMAC-SHA256 stamps, key management, audit log
-├── notifications/        # Email system (SMTP)
-├── ui/                   # TreeView, status bar, webview panels
-└── util/                 # Config, queue, logger, rate limiter
+├── extension.ts          Activation and commands
+├── agent/
+│   ├── controller.ts     Per-repo scheduling, stop/halt, guarded forges
+│   ├── pipeline.ts       One repo's cycle: poll → PRs → follow-ups → next issue
+│   ├── state-store.ts    Persisted queue and history (survives restarts)
+│   ├── evaluator.ts      Multi-turn triage with READ_FILES exploration
+│   ├── investigator.ts   Gathers whole files and plans changes
+│   ├── coder.ts          Generate → validate → atomic commit → CI loop
+│   ├── transcriber.ts    The PR transcript comment
+│   ├── pr-gatekeeper.ts  Merge-gate commit statuses
+│   └── …                 Comment moderation, loop detection, competing PRs
+├── forge/                GitHub and GitLab clients; guarded.ts enforces dry run, halt, redaction, rate limits
+├── llm/                  Provider interface and providers (claude-code, vscode-lm, anthropic, …)
+├── security/             Sanitizer, validator, diff assessor, threat classifier, trust
+├── crypto/               Keys, stamps, nonces, audit log
+├── notifications/        Email
+└── ui/                   Tree views, status bar, settings webviews
 ```
 
-## Pipeline Flow
+## Security
 
-```
-Poll repo → Skip if last word → Evaluate (multi-turn) → Create branch
-  → Investigate → Code (iterative + CI) → Create PR → Post transcription
-  → Acknowledge issue → Monitor issue comments → Monitor PR review comments
-  → Analyze competing PRs → Optionally synthesize super PR
-```
-
-## Security Model
-
-Argus operates under a zero-trust model. All user-generated content (issues, comments, PR descriptions) is treated as potentially adversarial. See [SECURITY.md](SECURITY.md) for the full 12-layer defense architecture.
+See [SECURITY.md](SECURITY.md) for the threat model, what each defense does, and how to report a vulnerability.
 
 ## License
 
 `SPDX-License-Identifier: Apache-2.0 OR MIT`
 
-Dual-licensed under [Apache-2.0](LICENSE_APACHE2.TXT) or [MIT](LICENSE_MIT.TXT),
-**at your option** — take the Apache-2.0 terms if you want its express patent
-grant, MIT if you want the shorter text. You don't need to tell anyone which you
-picked. See [LICENSE.txt](LICENSE.txt) for the full statement.
-
-Contributions are dual-licensed the same way unless you say otherwise.
+Dual-licensed under [Apache-2.0](LICENSE_APACHE2.TXT) or [MIT](LICENSE_MIT.TXT), at your option. See [LICENSE.txt](LICENSE.txt).

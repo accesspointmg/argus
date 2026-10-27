@@ -209,8 +209,8 @@ export class EngagementPolicy {
 
     /** Whether a comment was posted by this Argus instance. */
     private isOurs(comment: Comment): boolean {
-        const shortId = this.stampManager.extractInstanceId(comment.body);
-        return shortId !== null && this.stampManager.instanceId.startsWith(shortId);
+        // Verified, so a pasted stamp can't make someone else's comment count as ours.
+        return this.stampManager.isOwnAuthentic(comment.body);
     }
 
     /**
@@ -231,6 +231,8 @@ export class EngagementPolicy {
         if (comment.author.toLowerCase().endsWith(BOT_SUFFIX)) {
             return true;
         }
+        // Unverified on purpose: anything that looks stamped is treated as an agent,
+        // which can only make Argus quieter.
         return this.stampManager.hasStamp(comment.body);
     }
 

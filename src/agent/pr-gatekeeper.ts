@@ -4,77 +4,58 @@
  * PR Gatekeeper — decides whether a PR is safe to build and merge.
  *
  * Posts a commit status (`argus/threat-assessment`) on every open PR's HEAD
- * SHA.  Branch protection rules listing that context as required turn this
- * into a hard merge gate: nothing lands without a green verdict.
+ * SHA. Branch protection listing that context as required makes it a merge
+ * gate.
  *
- * Design principles:
- *
- *   1. **Statuses attach to a commit SHA.**  A force-push lands on a new SHA
- *      with no status, so the gate resets automatically.  This is the
- *      EditDetector bait-and-switch problem solving itself — no head-SHA
- *      tracking is needed.
- *
- *   2. **Argus never self-approves.**  PRs authored by this Argus instance
- *      get a `pending` status with "awaiting human review — Argus does not
- *      self-approve."  The seller must merge; Argus never merges.
- *
- *   3. **Fast paths skip the LLM.**  Trusted author + no execution-surface
- *      changes = instant `success`.  Untrusted author + critical surface
- *      changes = instant `failure`.  The LLM is only invoked in the middle
- *      band.  This keeps cost proportional to risk and avoids the offline
- *      deadlock for trusted authors' own PRs.
- *
- *   4. **`pending` before verdict.**  The instant Argus first sees an
- *      unassessed PR it posts `pending` ("assessment in progress").  This
- *      artifact exists even before the LLM returns, so a human cannot
- *      approve-and-merge in the gap.
- *
- *   5. **Portable.**  Uses `createCommitStatus()` (works on GitHub and
- *      GitLab) rather than the Checks API (GitHub-App-only).  A future
- *      GitHub App upgrade adds line annotations as enrichment, not as a
- *      replacement.
+ *   1. Statuses attach to a commit SHA, so a force-push resets the gate.
+ *   2. Argus's own PRs are assessed like everyone else's — they're the
+ *      highest-risk PRs, written from attacker-supplied issue text — with no
+ *      trusted-author fast path. A clean own PR stays `pending` ("awaiting
+ *      human review"): Argus never self-approves.
+ *   3. Fail closed: `fail`, `review`, and "assessment unavailable" all post
+ *      `failure`. Unavailable assessments are retried with backoff.
+ *   4. `pending` is posted before the verdict so nobody merges in the gap.
+ *   5. Assessed SHAs are persisted (Memento). If that record is lost, an
+ *      existing authentic Argus assessment comment for the SHA is reused
+ *      instead of paying for another LLM call and posting a duplicate.
+ *   6. Dry run is enforced by the guarded forge (writes are no-ops); this
+ *      class posts the honest state and never substitutes `success`.
  */
 
+import { isAbortError, throwIfAborted } from '../util/abort';
+import type * as vscode from 'vscode';
 import type { Forge, PullRequest, RepoKey } from '../forge/types';
 import type { DiffAssessment, DiffVerdict } from '../security/types';
 import type { DiffAssessor } from '../security/diff-assessor';
-import type { TrustResolver } from '../security/trust';
-import type { StampManager } from '../crypto/stamp';
+import type { TrustManager } from '../security/trust';
+import { artifactId, type StampManager } from '../crypto/stamp';
 import type { AuditLog } from '../crypto/audit';
 import type { Logger } from '../util/logger';
+import { neutralizeForPost } from '../security/sanitizer';
+import { readSetting, type SettingReader } from '../security/settings';
 
 // ─── Constants ──────────────────────────────────────────────────
 
-/**
- * The commit-status context name.  Branch protection rules reference this
- * exact string, so changing it breaks every repo that lists it as required.
- */
+/** Branch protection references this exact string. Don't change it. */
 const STATUS_CONTEXT = 'argus/threat-assessment';
 
-/** Description ceiling — GitHub truncates at 140 chars. */
+/** GitHub truncates descriptions at 140 chars. */
 const MAX_DESCRIPTION = 140;
+
+const STATE_KEY = 'argus.gatekeeper.assessed';
+const MAX_RECORDS = 2000;
+const RETRY_BACKOFF_MS = 30 * 60 * 1000;
+const MAX_ATTEMPTS = 5;
+
+/** Machine-readable marker inside our (signed) assessment comment. */
+const MARKER = /<!-- argus-assessment sha=([a-f0-9]{7,64}) verdict=(pass|fail|review) final=(0|1) -->/;
+
+type StatusState = 'pending' | 'success' | 'failure' | 'error';
 
 // ─── Types ──────────────────────────────────────────────────────
 
-export interface GatekeeperConfig {
-    /** Post statuses but never `failure` — advisory mode. */
-    dryRun: boolean;
-    /**
-     * Whether PRs from trusted authors (score >= autoPassThreshold) that
-     * touch no execution surface should get an instant `success` without
-     * an LLM call.  Cheaper, faster, avoids the offline deadlock for the
-     * repo owner's own work — at the cost of not reading their diffs.
-     */
-    fastPathTrustedAuthors: boolean;
-    /** Trust score at or above which the fast path applies. */
-    autoPassThreshold: number;
-}
-
-const DEFAULT_CONFIG: GatekeeperConfig = {
-    dryRun: false,
-    fastPathTrustedAuthors: true,
-    autoPassThreshold: 0.5,
-};
+/** @deprecated Settings are read live; kept for the agent/index re-export. */
+export type GatekeeperConfig = Record<string, never>;
 
 export interface GatekeeperResult {
     prNumber: number;
@@ -82,162 +63,135 @@ export interface GatekeeperResult {
     verdict: DiffVerdict | 'self' | 'skipped';
     statusPosted: boolean;
     assessment?: DiffAssessment;
+    ownPR?: boolean;
     reason: string;
+}
+
+interface AssessedRecord {
+    verdict: DiffVerdict;
+    /** False when the assessment was unavailable and should be retried. */
+    final: boolean;
+    at: number;
+    attempts: number;
 }
 
 // ─── Gatekeeper ─────────────────────────────────────────────────
 
 export class PRGatekeeper {
-    private readonly config: GatekeeperConfig;
-
-    /**
-     * SHAs we have already posted a final (non-pending) status for during
-     * this session.  Prevents re-assessing the same commit on every poll.
-     * Cleared on force-push automatically because the SHA changes.
-     */
-    private assessed = new Set<string>();
+    /** Dry-run results stay in memory so turning dry run off re-assesses for real. */
+    private dryRunRecords = new Map<string, AssessedRecord>();
 
     constructor(
         private readonly diffAssessor: DiffAssessor,
-        private readonly trustResolver: TrustResolver,
+        private readonly trust: TrustManager,
         private readonly stampManager: StampManager,
         private readonly auditLog: AuditLog,
         private readonly logger: Logger,
-        config?: Partial<GatekeeperConfig>,
-    ) {
-        this.config = { ...DEFAULT_CONFIG, ...config };
-    }
+        private readonly state: vscode.Memento,
+        private readonly settings: SettingReader = readSetting,
+    ) {}
 
-    /**
-     * Assess every open PR in a repo and post commit statuses.
-     *
-     * Intended to be called from the poll cycle alongside `pollPRComments`.
-     * Returns the number of PRs that received a new status.
-     */
-    async assessAll(forge: Forge, openPRs: PullRequest[]): Promise<number> {
+    /** Assess every open PR and post statuses. Returns how many got a new status. */
+    async assessAll(forge: Forge, openPRs: PullRequest[], signal?: AbortSignal): Promise<number> {
         const repoKey: RepoKey = `${forge.platform}:${forge.owner}/${forge.repo}`;
         let posted = 0;
-
         for (const pr of openPRs) {
+            throwIfAborted(signal);
             try {
                 const result = await this.assessOne(forge, pr, repoKey);
                 if (result.statusPosted) { posted++; }
             } catch (err) {
+                // Stop / Emergency Stop must end the whole pass, not just this PR.
+                if (isAbortError(err)) { throw err; }
                 this.logger.error(`Gatekeeper error on PR #${pr.number}: ${err}`);
             }
         }
-
         if (posted > 0) {
-            this.logger.info(
-                `Gatekeeper: posted ${posted} status(es) in ${repoKey}`,
-            );
+            this.logger.info(`Gatekeeper: posted ${posted} status(es) in ${repoKey}`);
         }
-
         return posted;
     }
 
-    /**
-     * Assess a single PR. Idempotent per SHA — if we've already posted a
-     * final status for this SHA, returns immediately.
-     */
-    async assessOne(
-        forge: Forge,
-        pr: PullRequest,
-        repoKey: RepoKey,
-    ): Promise<GatekeeperResult> {
+    /** Assess a single PR. Idempotent per SHA (persisted). */
+    async assessOne(forge: Forge, pr: PullRequest, repoKey: RepoKey): Promise<GatekeeperResult> {
         const sha = pr.headSha;
+        const skip = (reason: string): GatekeeperResult =>
+            ({ prNumber: pr.number, headSha: sha ?? '', verdict: 'skipped', statusPosted: false, reason });
 
-        // No SHA available (shouldn't happen, but defensive)
-        if (!sha) {
-            return {
-                prNumber: pr.number,
-                headSha: '',
-                verdict: 'skipped',
-                statusPosted: false,
-                reason: 'No head SHA available on PR',
-            };
+        if (!sha) { return skip('No head SHA available on PR'); }
+
+        const dryRun = this.settings('dryRun', false);
+        const tag = dryRun ? '[DRY RUN] ' : '';
+        const key = `${repoKey}@${sha}`;
+        const prior = this.getRecord(key, dryRun);
+
+        if (prior?.final) { return skip('Already assessed this SHA'); }
+        if (prior && (prior.attempts >= MAX_ATTEMPTS || Date.now() - prior.at < RETRY_BACKOFF_MS)) {
+            return skip('Assessment unavailable earlier; waiting before retry');
         }
 
-        // Already assessed this exact SHA
-        if (this.assessed.has(sha)) {
-            return {
-                prNumber: pr.number,
-                headSha: sha,
-                verdict: 'skipped',
-                statusPosted: false,
-                reason: 'Already assessed this SHA',
-            };
+        const ownPR = this.stampManager.isOwnAuthentic(pr.body ?? '', artifactId(repoKey, 'pr', pr.number));
+        const attempts = (prior?.attempts ?? 0) + 1;
+
+        // State lost but we already assessed this SHA? Reuse our signed verdict.
+        if (!prior) {
+            const existing = await this.findOwnAssessment(forge, repoKey, pr.number, sha);
+            if (existing?.final) {
+                const { state, description } = this.statusFor(existing.verdict, ownPR, false, undefined);
+                await this.postStatus(forge, sha, state, description);
+                await this.setRecord(key, { verdict: existing.verdict, final: true, at: Date.now(), attempts }, dryRun);
+                this.logger.info(`${tag}PR #${pr.number} (${sha.substring(0, 8)}): reused earlier assessment (${existing.verdict})`);
+                return { prNumber: pr.number, headSha: sha, verdict: existing.verdict, statusPosted: true, ownPR, reason: 'Reused earlier assessment' };
+            }
+            // First sight: block the merge window before the verdict exists.
+            await this.postStatus(forge, sha, 'pending', 'Assessment in progress — do not merge yet.');
         }
 
-        // ── Self-assessment guard ──
-        // Argus's own PRs are never self-approved.
-        if (this.isOurPR(pr)) {
-            await this.postStatus(forge, sha, 'pending',
-                'Awaiting human review \u2014 Argus does not self-approve.');
-            this.assessed.add(sha);
-
-            this.logger.info(
-                `PR #${pr.number}: self-authored \u2014 posted pending, not self-approving`,
-            );
-
-            return {
-                prNumber: pr.number,
-                headSha: sha,
-                verdict: 'self',
-                statusPosted: true,
-                reason: 'Self-authored PR \u2014 awaiting human review',
-            };
+        let assessment: DiffAssessment;
+        try {
+            const author = await this.trust.resolve(forge, pr.author, pr.authorAssociation);
+            const files = await forge.getPRFiles(pr.number);
+            assessment = await this.diffAssessor.assess(files, author, sha, {
+                prTitle: pr.title,
+                prBody: pr.body,
+                forceLlm: ownPR,
+            });
+        } catch (err) {
+            // Status stays pending (not mergeable); retry later.
+            await this.setRecord(key, { verdict: 'review', final: false, at: Date.now(), attempts }, dryRun);
+            throw err;
         }
 
-        // ── Post pending immediately ──
-        // This closes the window between "Argus sees the PR" and "Argus
-        // finishes assessing" — the status exists before the verdict.
-        await this.postStatus(forge, sha, 'pending',
-            'Assessment in progress \u2014 do not merge yet.');
+        const final = !assessment.unavailable;
+        const { state, description } = this.statusFor(assessment.verdict, ownPR, !!assessment.unavailable, assessment);
+        await this.postStatus(forge, sha, state, description);
 
-        // ── Resolve author trust ──
-        const author = await this.trustResolver.resolve(forge, pr.author);
-
-        // ── Get files ──
-        const files = await forge.getPRFiles(pr.number);
-
-        // ── Run the diff assessor ──
-        const assessment = await this.diffAssessor.assess(files, author, sha);
-
-        // ── Map verdict to status ──
-        const state = this.verdictToState(assessment.verdict);
-        const description = this.buildDescription(assessment);
-
-        if (this.config.dryRun && state === 'failure') {
-            // Advisory mode: post success with a note
-            await this.postStatus(forge, sha, 'success',
-                `[DRY RUN] Would have blocked: ${description}`);
-        } else {
-            await this.postStatus(forge, sha, state, description);
+        // Evidence comment: on anything but a clean pass, or when exec-surface files were touched.
+        // Unavailable assessments comment once (first attempt), not on every retry.
+        const wantsComment = assessment.verdict !== 'pass' || assessment.executionSurfaceChanges.length > 0;
+        if (wantsComment && (final || attempts === 1)) {
+            const existing = await this.findOwnAssessment(forge, repoKey, pr.number, sha);
+            if (!existing || existing.verdict !== assessment.verdict || existing.final !== final) {
+                await this.postAssessmentComment(forge, pr.number, assessment, ownPR, final, repoKey);
+            }
         }
 
-        // ── Post a comment with the evidence ──
-        if (assessment.verdict !== 'pass' || assessment.executionSurfaceChanges.length > 0) {
-            await this.postAssessmentComment(forge, pr.number, assessment);
-        }
-
-        // ── Audit ──
         await this.auditLog.append({
             action: 'gate_pr',
             repo: `${forge.owner}/${forge.repo}`,
             target: pr.url,
             input: sha,
-            output: assessment.verdict,
-            decision: `${assessment.verdict} (confidence ${(assessment.confidence * 100).toFixed(0)}%)`,
+            output: `${assessment.verdict}${final ? '' : ' (unavailable)'}`,
+            decision: `${tag}${state}: ${assessment.verdict} (confidence ${(assessment.confidence * 100).toFixed(0)}%)${ownPR ? ' [own PR]' : ''}`,
             llmCallCount: assessment.llmCalls,
-            details: assessment.reasoning.substring(0, 200),
+            details: neutralizeForPost(assessment.reasoning, 200),
         });
 
-        this.assessed.add(sha);
+        await this.setRecord(key, { verdict: assessment.verdict, final, at: Date.now(), attempts }, dryRun);
 
         this.logger.info(
-            `PR #${pr.number} (${sha.substring(0, 8)}): ` +
-            `${assessment.verdict} \u2014 ${assessment.reasoning.substring(0, 120)}`,
+            `${tag}PR #${pr.number} (${sha.substring(0, 8)}): ${state} / ${assessment.verdict}` +
+            `${final ? '' : ' (assessment unavailable)'}${ownPR ? ' [own PR]' : ''}`,
         );
 
         return {
@@ -246,120 +200,166 @@ export class PRGatekeeper {
             verdict: assessment.verdict,
             statusPosted: true,
             assessment,
+            ownPR,
             reason: assessment.reasoning,
         };
     }
 
-    /**
-     * Clear the assessed cache. Useful on config change or manual reset.
-     */
-    clearCache(): void {
-        this.assessed.clear();
+    /** Forget all assessed SHAs (persisted and in-memory). */
+    async clearCache(): Promise<void> {
+        this.dryRunRecords.clear();
+        await this.state.update(STATE_KEY, undefined);
+    }
+
+    // ─── Verdict → status ───────────────────────────────────────
+
+    /** Pure mapping. Everything that isn't a clean pass blocks the merge. */
+    statusFor(
+        verdict: DiffVerdict,
+        ownPR: boolean,
+        unavailable: boolean,
+        assessment: DiffAssessment | undefined,
+    ): { state: StatusState; description: string } {
+        if (unavailable) {
+            return { state: 'failure', description: 'Assessment unavailable — human review required.' };
+        }
+        const trustInfo = assessment
+            ? ` — trust: ${assessment.authorTrust.tier}/${assessment.authorTrust.effectiveTrustScore.toFixed(2)}`
+            : '';
+        const surface = assessment?.executionSurfaceChanges.length ?? 0;
+        switch (verdict) {
+            case 'pass':
+                if (ownPR) {
+                    // Assessed like any other PR. A required "pending" here would make every
+                    // Argus PR unmergeable without an admin override; human review is still
+                    // enforced by the repo's normal review rules.
+                    return { state: 'success', description: 'No threats found in this Argus-authored change — human review still required.' };
+                }
+                return {
+                    state: 'success',
+                    description: surface > 0 ? `Safe (${surface} exec-surface file(s) reviewed)${trustInfo}` : `Safe${trustInfo}`,
+                };
+            case 'fail': {
+                const why = assessment ? neutralizeForPost(assessment.evidence[0] ?? assessment.reasoning, 90) : '';
+                return { state: 'failure', description: `Blocked${why ? `: ${why}` : ''}` };
+            }
+            case 'review':
+            default:
+                return { state: 'failure', description: `Human review required — ${surface} exec-surface file(s)${trustInfo}` };
+        }
     }
 
     // ─── Internals ──────────────────────────────────────────────
 
-    /** Post a commit status via the forge. */
-    private async postStatus(
-        forge: Forge,
-        sha: string,
-        state: 'pending' | 'success' | 'failure' | 'error',
-        description: string,
-    ): Promise<void> {
+    private async postStatus(forge: Forge, sha: string, state: StatusState, description: string): Promise<void> {
         const truncated = description.length > MAX_DESCRIPTION
-            ? description.substring(0, MAX_DESCRIPTION - 1) + '\u2026'
+            ? description.substring(0, MAX_DESCRIPTION - 1) + '…'
             : description;
-
         await forge.createCommitStatus(sha, state, STATUS_CONTEXT, truncated);
     }
 
-    /** Map a DiffVerdict to a commit-status state. */
-    private verdictToState(verdict: DiffVerdict): 'success' | 'failure' | 'pending' {
-        switch (verdict) {
-            case 'pass':   return 'success';
-            case 'fail':   return 'failure';
-            case 'review': return 'pending';
+    /** Our authentic assessment comment for this SHA, if one exists. */
+    private async findOwnAssessment(
+        forge: Forge,
+        repoKey: RepoKey,
+        prNumber: number,
+        sha: string,
+    ): Promise<{ verdict: DiffVerdict; final: boolean } | undefined> {
+        let comments;
+        try {
+            comments = await forge.getPRComments(prNumber);
+        } catch {
+            return undefined;
         }
+        let found: { verdict: DiffVerdict; final: boolean } | undefined;
+        for (const c of comments) {
+            const m = MARKER.exec(c.body ?? '');
+            if (!m || m[1] !== sha) { continue; }
+            if (!this.stampManager.isOwnAuthentic(c.body, artifactId(repoKey, 'comment', c.id))) { continue; }
+            found = { verdict: m[2] as DiffVerdict, final: m[3] === '1' }; // latest wins
+        }
+        return found;
     }
 
-    /** Build a human-readable status description. */
-    private buildDescription(assessment: DiffAssessment): string {
-        const trustInfo = `${assessment.authorTrust.tier}/${assessment.authorTrust.effectiveTrustScore.toFixed(2)}`;
-        const surfaceCount = assessment.executionSurfaceChanges.length;
-
-        switch (assessment.verdict) {
-            case 'pass':
-                return surfaceCount > 0
-                    ? `Safe (${surfaceCount} exec-surface file(s) reviewed) \u2014 trust: ${trustInfo}`
-                    : `Safe \u2014 trust: ${trustInfo}`;
-            case 'fail':
-                return `Blocked: ${assessment.evidence[0] || assessment.reasoning.substring(0, 80)}`;
-            case 'review':
-                return `Human review required \u2014 ${surfaceCount} exec-surface file(s), trust: ${trustInfo}`;
-        }
+    private getRecord(key: string, dryRun: boolean): AssessedRecord | undefined {
+        if (dryRun) { return this.dryRunRecords.get(key); }
+        return this.state.get<Record<string, AssessedRecord>>(STATE_KEY)?.[key];
     }
 
-    /** Whether a PR was authored by this Argus instance. */
-    private isOurPR(pr: PullRequest): boolean {
-        if (!pr.body) { return false; }
-        const shortId = this.stampManager.extractInstanceId(pr.body);
-        return shortId !== null && this.stampManager.instanceId.startsWith(shortId);
+    private async setRecord(key: string, rec: AssessedRecord, dryRun: boolean): Promise<void> {
+        if (dryRun) {
+            this.dryRunRecords.set(key, rec);
+            return;
+        }
+        const all = { ...(this.state.get<Record<string, AssessedRecord>>(STATE_KEY) ?? {}) };
+        all[key] = rec;
+        const keys = Object.keys(all);
+        if (keys.length > MAX_RECORDS) {
+            keys.sort((a, b) => all[a].at - all[b].at);
+            for (const k of keys.slice(0, keys.length - MAX_RECORDS)) { delete all[k]; }
+        }
+        await this.state.update(STATE_KEY, all);
     }
 
     /**
-     * Post a structured comment on the PR summarizing the assessment.
-     *
-     * Only posted when the verdict is not a clean pass, or when
-     * execution-surface files were detected (even if passed).
+     * Evidence comment. Everything model- or attacker-derived (reasoning,
+     * evidence, file paths) is neutralized: no mentions, links, images, markup.
      */
     private async postAssessmentComment(
         forge: Forge,
         prNumber: number,
         assessment: DiffAssessment,
+        ownPR: boolean,
+        final: boolean,
+        repoKey: RepoKey,
     ): Promise<void> {
-        const icon = assessment.verdict === 'pass' ? '\u2705'
-            : assessment.verdict === 'fail' ? '\u274C'
-            : '\u26A0\uFE0F';
+        const icon = !final ? '⚠️'
+            : assessment.verdict === 'pass' ? '✅'
+            : assessment.verdict === 'fail' ? '❌'
+            : '⚠️';
+        const verdictLabel = !final ? 'ASSESSMENT UNAVAILABLE' : assessment.verdict.toUpperCase();
 
         const surfaceSection = assessment.executionSurfaceChanges.length > 0
-            ? `### Execution Surface Changes\n\n` +
-              `| Risk | File | Detail |\n|---|---|---|\n` +
-              assessment.executionSurfaceChanges
+            ? '### Execution Surface Changes\n\n| Risk | File | Detail |\n|---|---|---|\n' +
+              [...assessment.executionSurfaceChanges]
                   .sort((a, b) => riskOrder(a.risk) - riskOrder(b.risk))
-                  .map((c) => `| **${c.risk.toUpperCase()}** | \`${c.path}\` | ${c.detail} |`)
-                  .join('\n') +
-              '\n'
+                  .slice(0, 50)
+                  .map((c) => `| **${c.risk.toUpperCase()}** | \`${neutralizeForPost(c.path, 200)}\` | ${c.detail} |`)
+                  .join('\n') + '\n'
             : '';
 
-        const evidenceSection = assessment.evidence.length > 0
-            ? `### Evidence\n\n${assessment.evidence.map((e) => `- ${e}`).join('\n')}\n`
+        const evidence = assessment.evidence.slice(0, 10).map((e) => neutralizeForPost(e, 200)).filter(Boolean);
+        const evidenceSection = evidence.length > 0
+            ? `### Evidence\n\n${evidence.map((e) => `- ${e}`).join('\n')}\n`
             : '';
 
+        const author = assessment.authorTrust.username.replace(/[^\w-]/g, '');
         const content = `## ${icon} Argus Threat Assessment
 
 | | |
 |---|---|
-| **Verdict** | **${assessment.verdict.toUpperCase()}** |
+| **Verdict** | **${verdictLabel}** |
 | **Confidence** | ${(assessment.confidence * 100).toFixed(0)}% |
-| **Author** | @${assessment.authorTrust.username} (${assessment.authorTrust.tier}, trust score ${assessment.authorTrust.effectiveTrustScore.toFixed(2)}) |
-| **Commit** | \`${assessment.commitSha.substring(0, 8)}\` |
+| **Author** | ${author} (${assessment.authorTrust.tier}, trust score ${assessment.authorTrust.effectiveTrustScore.toFixed(2)})${ownPR ? ' — Argus-authored' : ''} |
+| **Commit** | \`${assessment.commitSha.substring(0, 12)}\` |
 | **LLM calls** | ${assessment.llmCalls} |
 
 ### Reasoning
 
-${assessment.reasoning}
+${neutralizeForPost(assessment.reasoning, 600)}
 
 ${surfaceSection}${evidenceSection}
-> This assessment was performed by Argus's diff security assessor.
-> It evaluates whether the changes are safe to build on trusted infrastructure.
-> Argus **never** merges PRs \u2014 a human must approve and merge.`;
+> Argus's diff security assessor evaluates whether the changes are safe to build on trusted infrastructure.
+> ${final ? '' : 'The assessment could not be completed, so the merge gate is closed until a human reviews. '}Argus **never** merges PRs — a human must approve and merge.
 
-        const { stamped } = this.stampManager.stampContent(content);
-        await forge.addPRComment(prNumber, stamped);
+<!-- argus-assessment sha=${assessment.commitSha} verdict=${assessment.verdict} final=${final ? 1 : 0} -->`;
+
+        const { stamped, stamp } = this.stampManager.stampContent(content);
+        const comment = await forge.addPRComment(prNumber, stamped);
+        if (comment?.id) { this.stampManager.recordPosted(stamp, artifactId(repoKey, 'comment', comment.id), repoKey); }
     }
 }
 
-/** Sort helper: critical first. */
 function riskOrder(risk: string): number {
     switch (risk) {
         case 'critical': return 0;

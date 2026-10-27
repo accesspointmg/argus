@@ -1,117 +1,71 @@
 // Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
- * Email templates — structured HTML/text templates for Argus notifications.
+ * Email templates. Every interpolated value is escaped: titles and details
+ * often contain issue text written by strangers.
  */
 
-import type { TrackedIssue, IssueEvaluation, PRAnalysis, CodingIteration } from '../agent/types';
+import type { RepoKey } from '../forge/types';
+import type { EmailEventName } from '../util/config';
+import type { EmailMessage } from './email';
 
-function escapeHtml(str: string): string {
-    return str
+export function escapeHtml(str: string): string {
+    return String(str ?? '')
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
 }
 
-export function issueEvaluated(issue: TrackedIssue, evaluation: IssueEvaluation): { subject: string; text: string; html: string } {
-    const verdict = evaluation.merit ? 'APPROVED' : 'REJECTED';
-    return {
-        subject: `[Argus] Issue #${issue.issueNumber} ${verdict}: ${issue.title}`,
-        text: `Argus evaluated issue #${issue.issueNumber}: ${issue.title}\n\nVerdict: ${verdict}\nCategory: ${evaluation.category}\nSeverity: ${evaluation.severity}\nConfidence: ${(evaluation.confidence * 100).toFixed(0)}%\n\nReasoning:\n${evaluation.reasoning}\n\nURL: ${issue.url}`,
-        html: `
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
-  <h2 style="color: ${evaluation.merit ? '#22863a' : '#cb2431'};">
-    ${evaluation.merit ? '✅' : '❌'} Issue #${issue.issueNumber} ${verdict}
-  </h2>
-  <p><strong>${escapeHtml(issue.title)}</strong></p>
-  <table style="border-collapse: collapse; width: 100%;">
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Category</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">${evaluation.category}</td></tr>
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Severity</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">${evaluation.severity}</td></tr>
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Confidence</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">${(evaluation.confidence * 100).toFixed(0)}%</td></tr>
-  </table>
-  <h3>Reasoning</h3>
-  <p>${escapeHtml(evaluation.reasoning)}</p>
-  <p><a href="${issue.url}">View Issue →</a></p>
-</div>`,
-    };
+const HEADINGS: Record<EmailEventName, { icon: string; label: string; color: string }> = {
+    prOpened: { icon: '📤', label: 'Pull request opened', color: '#0969da' },
+    prStuck: { icon: '🧱', label: 'Argus is stuck', color: '#9a6700' },
+    ciPassedFinal: { icon: '✅', label: 'CI passing', color: '#1a7f37' },
+    threatDetected: { icon: '⚠️', label: 'Threat detected', color: '#cf222e' },
+    userBlocked: { icon: '⛔', label: 'User blocked', color: '#cf222e' },
+    emergencyStop: { icon: '🛑', label: 'Emergency stop', color: '#cf222e' },
+    rateLimitWarning: { icon: '⏳', label: 'Rate limit reached', color: '#9a6700' },
+    anomalyDetected: { icon: '🚨', label: 'Anomaly detected', color: '#cf222e' },
+    systemError: { icon: '❗', label: 'Error', color: '#cf222e' },
+};
+
+/** Only http(s) links are rendered; anything else is shown as text. */
+function safeUrl(url: string | undefined): string | undefined {
+    return url && /^https?:\/\//i.test(url) ? url : undefined;
 }
 
-export function prCreated(issue: TrackedIssue, iterations: CodingIteration[]): { subject: string; text: string; html: string } {
-    const lastCI = iterations[iterations.length - 1]?.ciResult;
-    return {
-        subject: `[Argus] PR #${issue.prNumber} opened for issue #${issue.issueNumber}`,
-        text: `Argus created PR #${issue.prNumber} for issue #${issue.issueNumber}: ${issue.title}\n\nIterations: ${iterations.length}\nCI: ${lastCI || 'unknown'}\n\nPR URL: ${issue.prUrl}\nIssue URL: ${issue.url}`,
-        html: `
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
-  <h2>📤 PR #${issue.prNumber} Opened</h2>
-  <p>For issue #${issue.issueNumber}: <strong>${escapeHtml(issue.title)}</strong></p>
-  <ul>
-    <li>Iterations: ${iterations.length}</li>
-    <li>CI: ${lastCI === 'passing' ? '✅ Passing' : lastCI === 'failing' ? '❌ Failing' : '⏳ Pending'}</li>
-  </ul>
-  <p><a href="${issue.prUrl}">View PR →</a> · <a href="${issue.url}">View Issue →</a></p>
-</div>`,
-    };
+/** Subjects are single-line and bounded; nodemailer encodes the rest. */
+function subjectLine(text: string): string {
+    const one = text.replace(/[\r\n]+/g, ' ').trim();
+    return one.length > 150 ? `${one.slice(0, 150)}…` : one;
 }
 
-export function threatDetected(
-    repo: string,
-    username: string,
-    classification: string,
-    confidence: number,
-    actions: string[],
-): { subject: string; text: string; html: string } {
-    return {
-        subject: `[Argus] ⚠️ Threat detected in ${repo} by @${username}`,
-        text: `Argus detected a ${classification} threat in ${repo}.\n\nUser: @${username}\nClassification: ${classification}\nConfidence: ${(confidence * 100).toFixed(0)}%\nActions: ${actions.join(', ')}`,
-        html: `
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
-  <h2 style="color: #cb2431;">⚠️ Threat Detected</h2>
-  <p>In <strong>${escapeHtml(repo)}</strong> by <strong>@${escapeHtml(username)}</strong></p>
-  <table style="border-collapse: collapse; width: 100%;">
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Classification</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8; color: #cb2431;">${classification}</td></tr>
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Confidence</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">${(confidence * 100).toFixed(0)}%</td></tr>
-    <tr><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">Actions</td><td style="padding: 4px 8px; border: 1px solid #e1e4e8;">${actions.join(', ')}</td></tr>
-  </table>
-</div>`,
-    };
-}
+export function notificationEmail(
+    event: EmailEventName,
+    repo: RepoKey | undefined,
+    details: { title: string; detail?: string; url?: string },
+): EmailMessage {
+    const h = HEADINGS[event];
+    const url = safeUrl(details.url);
+    const repoText = repo ?? 'all repositories';
 
-export function competingPRsAnalyzed(
-    issue: TrackedIssue,
-    analyses: PRAnalysis[],
-): { subject: string; text: string; html: string } {
-    const ranked = [...analyses].sort((a, b) => b.overallScore - a.overallScore);
-    return {
-        subject: `[Argus] ${analyses.length} competing PR(s) analyzed for #${issue.issueNumber}`,
-        text: `Argus analyzed ${analyses.length} competing PRs for issue #${issue.issueNumber}.\n\n${
-            ranked.map((pr, i) => `${i + 1}. PR #${pr.prNumber} by @${pr.author}: ${(pr.overallScore * 100).toFixed(0)}%`).join('\n')
-        }`,
-        html: `
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
-  <h2>⚔️ Competing PRs for #${issue.issueNumber}</h2>
-  <ol>
-    ${ranked.map((pr) => `<li><strong>PR #${pr.prNumber}</strong> by @${escapeHtml(pr.author)} — ${(pr.overallScore * 100).toFixed(0)}% ${pr.ciPassing ? '✅' : '❌'}</li>`).join('\n    ')}
-  </ol>
-  <p><a href="${issue.prUrl}">View Our PR →</a></p>
-</div>`,
-    };
-}
+    const text = [
+        `${h.label} — ${repoText}`,
+        '',
+        details.title,
+        details.detail ? `\n${details.detail}` : '',
+        url ? `\n${url}` : '',
+    ].join('\n');
 
-export function pipelineError(
-    issueNumber: number,
-    repo: string,
-    error: string,
-): { subject: string; text: string; html: string } {
-    return {
-        subject: `[Argus] ❗ Pipeline error on #${issueNumber} in ${repo}`,
-        text: `Argus encountered an error processing issue #${issueNumber} in ${repo}.\n\nError: ${error}`,
-        html: `
-<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
-  <h2 style="color: #cb2431;">❗ Pipeline Error</h2>
-  <p>Issue #${issueNumber} in <strong>${escapeHtml(repo)}</strong></p>
-  <pre style="background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto;">${escapeHtml(error)}</pre>
-</div>`,
-    };
+    const html = `
+<div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:600px">
+  <h2 style="color:${h.color}">${h.icon} ${escapeHtml(h.label)}</h2>
+  <p style="color:#57606a">${escapeHtml(repoText)}</p>
+  <p><strong>${escapeHtml(details.title)}</strong></p>
+  ${details.detail ? `<pre style="white-space:pre-wrap;background:#f6f8fa;padding:12px;border-radius:6px">${escapeHtml(details.detail.slice(0, 4000))}</pre>` : ''}
+  ${url ? `<p><a href="${escapeHtml(url)}">Open →</a></p>` : ''}
+</div>`;
+
+    return { subject: subjectLine(`[Argus] ${h.label}: ${details.title}`), text, html };
 }

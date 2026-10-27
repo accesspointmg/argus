@@ -11,6 +11,8 @@ import type { RepoKey } from '../forge/types';
 export type IssueState =
     | 'pending'
     | 'evaluating'
+    /** Evaluated with merit, but the author is not trusted to trigger code generation. */
+    | 'awaiting-approval'
     | 'approved'
     | 'rejected'
     | 'branching'
@@ -35,7 +37,16 @@ export interface TrackedIssue {
     createdAt: Date;
     startedAt?: Date;
     completedAt?: Date;
-    bodyHash: string;              // SHA-256 for edit detection
+    /** SHA-256 of the body Argus evaluated; later edits are detected against it. */
+    bodyHash: string;
+    author?: string;
+    /** Trusted user whose `/argus fix` comment authorized code generation. */
+    approvedBy?: string;
+    /**
+     * When the body matching `bodyHash` was first seen. Approvals posted before
+     * this don't count: they approved a different text.
+     */
+    bodySeenAt?: Date;
     branchName?: string;
     prNumber?: number;
     prUrl?: string;
@@ -60,7 +71,18 @@ export interface IssueEvaluation {
     severity: 'critical' | 'high' | 'medium' | 'low' | 'trivial';
     category: 'bug' | 'feature' | 'improvement' | 'docs' | 'question' | 'duplicate' | 'invalid';
     duplicateOf?: number;
+    /**
+     * Set when the evaluation itself failed (model error, missing canary,
+     * unparseable reply). Such evaluations always carry `merit: false` and
+     * must be routed to a human, never acted on.
+     */
+    reviewRequired?: boolean;
 }
+
+export const SEVERITIES: readonly IssueEvaluation['severity'][] = ['critical', 'high', 'medium', 'low', 'trivial'];
+export const CATEGORIES: readonly IssueEvaluation['category'][] = [
+    'bug', 'feature', 'improvement', 'docs', 'question', 'duplicate', 'invalid',
+];
 
 // ─── Comment Evaluation ─────────────────────────────────────────────
 
@@ -117,22 +139,6 @@ export interface SynthesisCandidate {
     conflictsToResolve: string[];
 }
 
-// ─── Session Isolation ──────────────────────────────────────────────
-
-export interface IssueSession {
-    issueNumber: number;
-    repo: RepoKey;
-    startedAt: Date;
-    llmConversationHistory: never[]; // Never shared — always empty on creation
-    filesRead: string[];
-    filesModified: string[];
-    stampsGenerated: string[];
-    noncesUsed: string[];
-    llmCallCount: number;
-    aborted: boolean;
-    abortReason?: string;
-}
-
 // ─── Coding Iteration ───────────────────────────────────────────────
 
 export interface CodingIteration {
@@ -141,7 +147,10 @@ export interface CodingIteration {
     commitMessage: string;
     reasoning: string;
     selfReview: string;
-    ciResult?: 'pending' | 'passing' | 'failing';
+    /** `none` = the repo reported no CI at all; `pending` = CI did not finish in time. */
+    ciResult?: 'pending' | 'passing' | 'failing' | 'none';
+    /** Commit created by this iteration. */
+    commitSha?: string;
     ciLog?: string;
 }
 

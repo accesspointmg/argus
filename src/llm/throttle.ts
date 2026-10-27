@@ -19,10 +19,40 @@
  * issue `stuck` with the reason attached; the next poll picks it up again.
  */
 
-import { RateLimiter } from '../util/rate-limiter';
 import { LlmRateLimitError } from './types';
 
 const SECONDS_PER_HOUR = 3600;
+
+/** Token bucket: `capacity` burst, refilled at `perSecond`. Local so the budget has no outside dependency. */
+class Bucket {
+    private tokens: number;
+    private last = Date.now();
+
+    constructor(private readonly capacity: number, private readonly perSecond: number, initial = capacity) {
+        this.tokens = Math.min(capacity, Math.max(0, initial));
+    }
+
+    tryConsume(): boolean {
+        this.refill();
+        if (this.tokens >= 1) {
+            this.tokens -= 1;
+            return true;
+        }
+        return false;
+    }
+
+    /** Exact (fractional) tokens left. */
+    level(): number {
+        this.refill();
+        return this.tokens;
+    }
+
+    private refill(): void {
+        const now = Date.now();
+        this.tokens = Math.min(this.capacity, this.tokens + ((now - this.last) / 1000) * this.perSecond);
+        this.last = now;
+    }
+}
 
 /**
  * Smallest limit we will honor.
@@ -34,7 +64,7 @@ const SECONDS_PER_HOUR = 3600;
 const MIN_CALLS_PER_HOUR = 1;
 
 export class LlmThrottle {
-    private limiter: RateLimiter;
+    private limiter: Bucket;
     private callsPerHour: number;
 
     constructor(callsPerHour: number) {
@@ -45,16 +75,19 @@ export class LlmThrottle {
     /**
      * Adopt a new limit if it changed.
      *
-     * Guarded on change because rebuilding refills the bucket: re-running this
-     * on every request would reset the budget each time and enforce nothing.
+     * Guarded on change, and the spent count carried over, because a rebuilt
+     * bucket starts full: rebuilding naively would reset the budget.
      */
     configure(callsPerHour: number): void {
         const next = LlmThrottle.clamp(callsPerHour);
         if (next === this.callsPerHour) {
             return;
         }
+        // Carry over what has been spent: a fresh full bucket would let anyone
+        // nudge the setting to reset the budget, even while lowering it.
+        const used = this.callsPerHour - this.limiter.level();
         this.callsPerHour = next;
-        this.limiter = LlmThrottle.build(next);
+        this.limiter = LlmThrottle.build(next, next - used);
     }
 
     /** Claim one call, or throw {@link LlmRateLimitError} if the budget is spent. */
@@ -73,7 +106,7 @@ export class LlmThrottle {
 
     /** Calls still available right now. For status display and tests. */
     remaining(): number {
-        return this.limiter.remaining();
+        return Math.floor(this.limiter.level());
     }
 
     /** The limit currently in force, after clamping. */
@@ -97,7 +130,7 @@ export class LlmThrottle {
      * nominal rate in one rolling hour — standard for a token bucket, and the
      * reason this is a guard rail rather than a billing guarantee.
      */
-    private static build(callsPerHour: number): RateLimiter {
-        return new RateLimiter(callsPerHour, callsPerHour / SECONDS_PER_HOUR);
+    private static build(callsPerHour: number, initial = callsPerHour): Bucket {
+        return new Bucket(callsPerHour, callsPerHour / SECONDS_PER_HOUR, initial);
     }
 }

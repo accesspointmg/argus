@@ -12,7 +12,7 @@
 
 import * as vscode from 'vscode';
 import type { ChatRequest, LlmProvider, ModelInfo, ProviderId } from '../types';
-import { LlmUnavailableError } from '../types';
+import { LlmRefusalError, LlmUnavailableError } from '../types';
 
 /** `128000` → `128K context`. Local to this file; the HTTP providers share their own. */
 function formatTokens(tokens: number | undefined): string | undefined {
@@ -104,6 +104,21 @@ export class VsCodeLmProvider implements LlmProvider {
                 text += chunk;
             }
             return text;
+        } catch (err) {
+            // Typed so callers can tell "user never granted access" and
+            // "vendor filtered it" from a transport failure.
+            if (err instanceof vscode.LanguageModelError) {
+                if (err.code === vscode.LanguageModelError.NoPermissions().code) {
+                    throw new LlmUnavailableError(`Not permitted to use ${this.label}: ${err.message}`);
+                }
+                if (err.code === vscode.LanguageModelError.Blocked().code) {
+                    throw new LlmRefusalError(`${this.label} blocked the request: ${err.message}`);
+                }
+                if (err.code === vscode.LanguageModelError.NotFound().code) {
+                    throw new LlmUnavailableError(`${this.label} is not available: ${err.message}`);
+                }
+            }
+            throw err;
         } finally {
             subscription?.dispose();
             source.dispose();

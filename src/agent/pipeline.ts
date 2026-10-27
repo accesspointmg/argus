@@ -1,78 +1,99 @@
 // Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
- * Pipeline — the main orchestrator that drives Argus's issue processing.
+ * RepoPipeline — everything Argus does for one repository, one cycle at a time.
  *
- * Flow:
- *  1. Poll for new issues
- *  2. Evaluate each issue (LLM merit assessment)
- *  3. Investigate (code search, file reads)
- *  4. Create branch
- *  5. Code (iterative LLM generation + CI check loop)
- *  6. Create PR with full transcription
- *  7. Monitor comments
- *  8. Analyze competing PRs
- *  9. Optionally synthesize a "super PR"
+ * A cycle:
+ *   1. poll issues updated since the last cycle and enqueue new ones;
+ *   2. review open PRs (merge-gate assessment; feedback and loop detection on
+ *      Argus's own PRs);
+ *   3. moderate new comments on issues Argus has PRs for;
+ *   4. process the next queued issue: evaluate → trust gate → branch →
+ *      investigate → code → PR.
+ *
+ * Invariants:
+ *   - One cycle per repo at a time (`running` lock); the controller schedules
+ *     the next cycle only after the previous one ends.
+ *   - State is persisted (see StateStore), and processing is idempotent: an
+ *     existing Argus PR or branch for an issue is reused, never duplicated.
+ *   - Code is only written for issues whose author is trusted, or after a
+ *     trusted user comments `/argus fix`. Everyone else gets triage labels.
+ *   - Settings are read at the start of each cycle, so changes apply without a
+ *     restart. Dry run and halting are enforced again by the GuardedForge.
  */
 
 import { createHash } from 'crypto';
-import type { Forge, Issue, PullRequest, RepoKey, ReviewComment } from '../forge/types';
-import {
-    TrackedIssue,
-    IssueState,
-    IssueSession,
-    ActivityEntry,
-} from './types';
-import { Evaluator } from './evaluator';
-import { Investigator } from './investigator';
-import { Coder } from './coder';
-import { Transcriber } from './transcriber';
-import { CommentHandler } from './comment-handler';
-import { EditDetector } from './edit-detector';
-import { PRAnalyzer } from './pr-analyzer';
-import { PRGatekeeper } from './pr-gatekeeper';
-import { LoopDetector, ChainAnalysis } from './loop-detector';
-import { EngagementPolicy, EngagementDecision } from './engagement';
+import * as vscode from 'vscode';
+import type { Comment, Forge, Issue, PullRequest, RepoConfig, RepoKey, ReviewComment } from '../forge/types';
+import { repoKey as toRepoKey } from '../forge/types';
+import type { CodingIteration, IssueEvaluation, TrackedIssue } from './types';
+import type { Evaluator } from './evaluator';
+import type { Investigator } from './investigator';
+import type { Coder } from './coder';
+import type { Transcriber } from './transcriber';
+import type { CommentHandler } from './comment-handler';
+import type { EditDetector } from './edit-detector';
+import type { PRAnalyzer } from './pr-analyzer';
+import type { PRGatekeeper } from './pr-gatekeeper';
+import { LoopDetector } from './loop-detector';
+import { EngagementPolicy } from './engagement';
+import type { StateStore, RepoState } from './state-store';
+import { ACTIVE_STATES } from './state-store';
 import type { StampManager } from '../crypto/stamp';
+import { artifactId } from '../crypto/stamp';
+import { resolveOwnership } from '../security/sovereignty';
 import type { AuditLog } from '../crypto/audit';
+import type { Sanitizer } from '../security/sanitizer';
+import type { TrustManager } from '../security/trust';
+import type { NotificationRouter } from '../notifications/events';
 import type { Logger } from '../util/logger';
+import type { ArgusConfig } from '../util/config';
+import { readConfig } from '../util/config';
+import { isAbortError, linkedController, throwIfAborted } from '../util/abort';
+import { inlineCode, neutralizeModelText, oneLine } from '../util/text';
 
-export interface PipelineConfig {
-    maxConcurrentIssues: number;
-    maxCodingIterations: number;
-    commentCheckInterval: number;  // ms
-    prPrefix: string;              // e.g., "argus/"
-    branchPrefix: string;
-    dryRun: boolean;
-    /**
-     * Comments Argus may post on one issue thread before going quiet.
-     * Mirrors MAX_ACKS_PER_PR, which bounds the PR side.
-     */
-    maxCommentsPerThread: number;
+// ─── Dependencies ───────────────────────────────────────────────
+
+/** Bounds how many issues are in active processing across all repos. */
+export interface WorkSlots {
+    tryAcquire(): boolean;
+    release(): void;
 }
 
-const DEFAULT_CONFIG: PipelineConfig = {
-    maxConcurrentIssues: 3,
-    maxCodingIterations: 5,
-    commentCheckInterval: 60_000,
-    prPrefix: '',
-    branchPrefix: 'argus/',
-    dryRun: false,
-    maxCommentsPerThread: 3,
-};
+export interface PipelineDeps {
+    evaluator: Evaluator;
+    investigator: Investigator;
+    coder: Coder;
+    transcriber: Transcriber;
+    commentHandler: CommentHandler;
+    editDetector: EditDetector;
+    prAnalyzer: PRAnalyzer;
+    gatekeeper: PRGatekeeper;
+    stampManager: StampManager;
+    auditLog: AuditLog;
+    sanitizer: Sanitizer;
+    trust: TrustManager;
+    notifier: NotificationRouter;
+    store: StateStore;
+    slots: WorkSlots;
+    /** Writes of a kind still allowed by `argus.rateLimits.*` right now. */
+    writeBudget: (kind: 'branch' | 'push' | 'pr' | 'comment') => number;
+    logger: Logger;
+}
 
-// ─── Bot Detection ──────────────────────────────────────────────
+// ─── Constants ──────────────────────────────────────────────────
 
-/**
- * Patterns that match bot *conversation* comments that are pure noise.
- * These are messages like "I've opened a new pull request #13" posted by
- * copilot-swe-agent — they don't contain substantive feedback and should
- * not trigger Argus to post another acknowledgment.
- *
- * Inline code-review comments from bots (e.g., copilot-pull-request-reviewer)
- * are NOT filtered — those contain valuable technical feedback that Argus
- * should evaluate.
- */
+/** First poll looks back this far. */
+const INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
+/** Acknowledgements per PR per window, so Argus can't be drawn into a conversation loop. */
+const MAX_ACKS_PER_PR = 3;
+const ACK_WINDOW_MS = 2 * 60 * 60 * 1000;
+/** A trusted user comments this to authorize code generation for an untrusted author's issue. */
+const APPROVAL_COMMAND = /^\s*\/argus\s+(fix|approve|go)\b/im;
+/** Low-confidence rejections go to a human instead of being closed out. */
+const REJECT_CONFIDENCE = 0.7;
+
+/** Bot conversation comments that carry no feedback (e.g. "I've opened a new pull request"). */
 const BOT_NOISE_PATTERNS: RegExp[] = [
     /I've opened a new pull request/i,
     /I'll request review from you/i,
@@ -80,955 +101,859 @@ const BOT_NOISE_PATTERNS: RegExp[] = [
     /Once the pull request is ready/i,
 ];
 
-/**
- * Returns true if a conversation comment is bot-generated noise
- * that should NOT trigger another Argus acknowledgment.
- *
- * This is intentionally narrow: only messages matching known noise patterns
- * from [bot] accounts are filtered. Any substantive comment — even from a
- * bot — passes through so Argus can evaluate it.
- */
 function isBotNoise(author: string, body: string): boolean {
-    // Only apply noise filter to bot accounts
-    if (!author.toLowerCase().endsWith('[bot]')) {
-        return false;
-    }
-    // Check if the message matches any known noise pattern
-    return BOT_NOISE_PATTERNS.some((pattern) => pattern.test(body));
+    return author.toLowerCase().endsWith('[bot]') && BOT_NOISE_PATTERNS.some((p) => p.test(body));
 }
 
-// ─── Rate Limiting ──────────────────────────────────────────────
-
-interface AckRecord {
-    count: number;
-    firstAckAt: Date;
-    lastAckAt: Date;
+function isWorkInProgress(pr: PullRequest): boolean {
+    if (pr.draft) { return true; }
+    const upper = pr.title.trim().toUpperCase();
+    return ['[WIP]', 'WIP:', 'WIP ', 'DRAFT:', '[DRAFT]'].some((p) => upper.startsWith(p)) || pr.title.includes('🚧');
 }
 
-/**
- * Max acknowledgments per PR before Argus backs off.
- * This allows 2–3 rounds of productive back-and-forth with Copilot
- * or human reviewers, then stops to prevent runaway loops.
- */
-const MAX_ACKS_PER_PR = 3;
 
-/** Window in which MAX_ACKS_PER_PR applies (ms). Reset after this. */
-const ACK_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
+export interface CycleResult {
+    skipped?: boolean;
+    enqueued: number;
+    processed?: TrackedIssue;
+}
 
-export class Pipeline {
-    private workQueue: TrackedIssue[] = [];
-    private activity: ActivityEntry[] = [];
-    private sessions = new Map<string, IssueSession>();
-    private config: PipelineConfig;
+// ─── Pipeline ───────────────────────────────────────────────────
 
-    // Track last poll time per repo
-    private lastPollTimes = new Map<RepoKey, Date>();
-
-    /** Tracks how many times we've acknowledged each PR to prevent loops. */
-    private ackTracker = new Map<string, AckRecord>();
-
-    /** PRs where Argus has already posted a loop-detected comment. */
-    private loopDisengaged = new Set<string>();
-
-    /** Chain-tracing loop detector shared across poll cycles. */
-    private loopDetector: LoopDetector;
-
-    /** Decides whether a thread still warrants a comment from us. */
-    private engagementPolicy: EngagementPolicy;
-
-    /** The gatekeeper — if provided, runs threat assessment on every open PR. */
-    private gatekeeper: PRGatekeeper | null = null;
+export class RepoPipeline {
+    readonly key: RepoKey;
+    private running = false;
+    private readonly loopDetector: LoopDetector;
 
     constructor(
-        private readonly evaluator: Evaluator,
-        private readonly investigator: Investigator,
-        private readonly coder: Coder,
-        private readonly transcriber: Transcriber,
-        private readonly commentHandler: CommentHandler,
-        private readonly editDetector: EditDetector,
-        private readonly prAnalyzer: PRAnalyzer,
-        private readonly stampManager: StampManager,
-        private readonly auditLog: AuditLog,
-        private readonly logger: Logger,
-        config?: Partial<PipelineConfig>,
+        readonly repo: RepoConfig,
+        private readonly forge: Forge,
+        private readonly deps: PipelineDeps,
     ) {
-        this.config = { ...DEFAULT_CONFIG, ...config };
-        this.loopDetector = new LoopDetector(stampManager, logger);
-        this.engagementPolicy = new EngagementPolicy(stampManager, logger, {
-            maxComments: this.config.maxCommentsPerThread,
-        });
+        this.key = toRepoKey(repo);
+        this.loopDetector = new LoopDetector(deps.stampManager, deps.logger);
     }
 
-    /**
-     * Attach a PRGatekeeper to the pipeline.
-     *
-     * When set, every `pollPRComments` cycle also runs threat assessment
-     * on every open PR and posts commit statuses. The gatekeeper shares
-     * the `listOpenPRs()` call with comment polling to avoid a redundant
-     * API round-trip.
-     */
-    setGatekeeper(gatekeeper: PRGatekeeper): void {
-        this.gatekeeper = gatekeeper;
+    get isRunning(): boolean {
+        return this.running;
     }
 
-    // ─── Public API ─────────────────────────────────────────────────
+    getQueue(): readonly TrackedIssue[] {
+        return this.state.queue;
+    }
 
-    /** Poll a repo for new issues and enqueue them. */
-    async pollRepo(forge: Forge): Promise<number> {
-        const repoKey: RepoKey = `${forge.platform}:${forge.owner}/${forge.repo}`;
-        const since = this.lastPollTimes.get(repoKey) || new Date(Date.now() - 24 * 60 * 60 * 1000);
+    private get state(): RepoState {
+        return this.deps.store.get(this.key);
+    }
 
-        this.logger.info(`Polling ${repoKey} for issues since ${since.toISOString()}`);
+    private get log(): Logger {
+        return this.deps.logger;
+    }
 
-        const issues = await forge.listNewIssues(since);
-        this.lastPollTimes.set(repoKey, new Date());
+    /** Run one full cycle. Returns immediately (skipped) if a cycle is already running. */
+    async runCycle(signal: AbortSignal): Promise<CycleResult> {
+        if (this.running) {
+            return { skipped: true, enqueued: 0 };
+        }
+        this.running = true;
+        try {
+            const cfg = readConfig();
+            const updated = await this.pollIssues(cfg, signal);
+            throwIfAborted(signal);
+            await this.reviewOpenPRs(cfg, signal);
+            throwIfAborted(signal);
+            await this.followUpdatedIssues(updated, cfg, signal);
+            throwIfAborted(signal);
+            const processed = await this.processNext(cfg, signal);
+            return { enqueued: updated.enqueued, processed };
+        } finally {
+            this.running = false;
+            await this.deps.store.save(this.key);
+        }
+    }
 
+    // ─── Queue management (used by commands) ───────────────────────
+
+    async enqueueIssueNumber(issueNumber: number): Promise<TrackedIssue> {
+        const existing = this.find(issueNumber);
+        if (existing) {
+            existing.state = 'pending';
+            existing.error = undefined;
+            await this.deps.store.save(this.key);
+            return existing;
+        }
+        const issue = await this.forge.getIssue(issueNumber);
+        const tracked = this.track(issue);
+        this.state.queue.unshift(tracked);
+        delete this.state.handled[String(issueNumber)];
+        await this.deps.store.save(this.key);
+        return tracked;
+    }
+
+    async setState(issueNumber: number, state: 'skipped' | 'pending'): Promise<boolean> {
+        const tracked = this.find(issueNumber);
+        if (!tracked || ACTIVE_STATES.includes(tracked.state)) { return false; }
+        tracked.state = state;
+        tracked.error = undefined;
+        if (state === 'pending') {
+            // A reprocess starts from scratch: re-evaluate against the current body.
+            tracked.evaluation = undefined;
+            tracked.approvedBy = undefined;
+        }
+        await this.deps.store.save(this.key);
+        return true;
+    }
+
+    async promote(issueNumber: number): Promise<boolean> {
+        const idx = this.state.queue.findIndex((t) => t.issueNumber === issueNumber && t.state === 'pending');
+        if (idx < 0) { return false; }
+        const [item] = this.state.queue.splice(idx, 1);
+        this.state.queue.unshift(item);
+        await this.deps.store.save(this.key);
+        return true;
+    }
+
+    async clearPending(): Promise<number> {
+        const before = this.state.queue.length;
+        this.state.queue = this.state.queue.filter((t) => t.state !== 'pending');
+        await this.deps.store.save(this.key);
+        return before - this.state.queue.length;
+    }
+
+    // ─── 1. Poll ───────────────────────────────────────────────────
+
+    /** Enqueue new issues; return the set of issue numbers that changed since the last poll. */
+    private async pollIssues(cfg: ArgusConfig, signal: AbortSignal): Promise<{ enqueued: number; changed: Set<number> }> {
+        const state = this.state;
+        const since = state.lastPoll ? new Date(state.lastPoll) : new Date(Date.now() - INITIAL_LOOKBACK_MS);
+        // Taken before the request, so issues created while it runs are caught next time.
+        const pollStartedAt = new Date().toISOString();
+
+        const issues = await this.forge.listNewIssues(since);
+        throwIfAborted(signal);
+        let queueFull = false;
+
+        const changed = new Set<number>();
         let enqueued = 0;
         for (const issue of issues) {
-            if (this.isAlreadyTracked(issue)) {
-                continue;
+            if (issue.state !== 'open') { continue; }
+            changed.add(issue.number);
+            if (this.find(issue.number) || state.handled[String(issue.number)]) { continue; }
+
+            const pending = state.queue.filter((t) => t.state === 'pending').length;
+            if (pending >= cfg.rateLimits.queueDepth) {
+                this.log.warn(`${this.key}: queue full (${pending}) — the rest wait for the next poll`);
+                queueFull = true;
+                break;
             }
 
-            // Decide whether there is anything new worth saying, and whether we
-            // have already said enough on this thread.
-            const engagement = await this.shouldEngage(forge, issue.number);
-            if (!engagement.engage) {
-                this.logger.info(`Skipping issue #${issue.number} — ${engagement.reason}`);
-                continue;
-            }
-
-            const tracked: TrackedIssue = {
-                issueNumber: issue.number,
-                repo: repoKey,
-                title: issue.title,
-                url: issue.url,
-                state: 'pending',
-                createdAt: issue.createdAt,
-                bodyHash: createHash('sha256').update(issue.body || '').digest('hex'),
-                currentIteration: 0,
-                maxIterations: this.config.maxCodingIterations,
-            };
-
-            this.workQueue.push(tracked);
-            this.addActivity(repoKey, issue.number, undefined, '📥', `Enqueued issue #${issue.number}: ${issue.title}`, issue.url);
+            state.queue.push(this.track(issue));
+            this.activity(issue.number, undefined, '📥', `Enqueued #${issue.number}: ${oneLine(issue.title, 80)}`, issue.url);
             enqueued++;
         }
 
-        await this.auditLog.append({
-            action: 'poll_repos',
-            repo: `${forge.owner}/${forge.repo}`,
-            target: repoKey,
-            input: since.toISOString(),
-            output: String(issues.length),
-            decision: `Found ${issues.length} issues, enqueued ${enqueued}`,
-            llmCallCount: 0,
-            details: `Poll ${repoKey}`,
-        });
-
-        return enqueued;
+        // When the queue filled up, keep the old cursor so the remaining issues are fetched again.
+        if (!queueFull) {
+            state.lastPoll = pollStartedAt;
+        }
+        if (enqueued > 0) {
+            this.log.info(`${this.key}: enqueued ${enqueued} issue(s)`);
+        }
+        return { enqueued, changed };
     }
 
-    /** Process the next issue in the work queue. */
-    async processNext(forge: Forge): Promise<TrackedIssue | undefined> {
-        const next = this.workQueue.find((i) => i.state === 'pending');
-        if (!next) {
-            return undefined;
-        }
-
-        // Check concurrent limit
-        const active = this.workQueue.filter((i) =>
-            !['pending', 'done', 'skipped', 'flagged', 'stuck', 'rejected'].includes(i.state)
-        );
-        if (active.length >= this.config.maxConcurrentIssues) {
-            this.logger.debug(`Concurrent limit reached (${active.length}/${this.config.maxConcurrentIssues})`);
-            return undefined;
-        }
-
-        return await this.processIssue(forge, next);
-    }
-
-    /** Process a specific issue through the full pipeline. */
-    async processIssue(forge: Forge, issue: TrackedIssue): Promise<TrackedIssue> {
-        const sessionKey = `${issue.repo}:${issue.issueNumber}`;
-        const session: IssueSession = {
-            issueNumber: issue.issueNumber,
-            repo: issue.repo,
-            startedAt: new Date(),
-            llmConversationHistory: [],
-            filesRead: [],
-            filesModified: [],
-            stampsGenerated: [],
-            noncesUsed: [],
-            llmCallCount: 0,
-            aborted: false,
+    private track(issue: Issue): TrackedIssue {
+        return {
+            issueNumber: issue.number,
+            repo: this.key,
+            title: issue.title,
+            url: issue.url,
+            state: 'pending',
+            createdAt: issue.createdAt,
+            bodyHash: hashBody(issue.body),
+            // The earliest the current text can have existed. An edit before Argus first saw
+            // the issue is not detectable here; later edits move this forward.
+            bodySeenAt: issue.createdAt,
+            author: issue.author,
+            currentIteration: 0,
+            maxIterations: readConfig().maxIterations,
         };
-        this.sessions.set(sessionKey, session);
-        issue.startedAt = new Date();
+    }
 
+    private find(issueNumber: number): TrackedIssue | undefined {
+        return this.state.queue.find((t) => t.issueNumber === issueNumber);
+    }
+
+    // ─── 2. Open PRs ───────────────────────────────────────────────
+
+    private async reviewOpenPRs(cfg: ArgusConfig, signal: AbortSignal): Promise<void> {
+        let openPRs: PullRequest[];
         try {
-            // ── Step 1: Evaluate ──
-            issue.state = 'evaluating';
-            this.addActivity(issue.repo, issue.issueNumber, undefined, '🔍', `Evaluating issue #${issue.issueNumber}`);
-            this.logger.info(`Evaluating issue #${issue.issueNumber}: ${issue.title}`);
-
-            const evaluation = await this.evaluator.evaluate(forge, await forge.getIssue(issue.issueNumber));
-            issue.evaluation = evaluation;
-
-            await this.auditLog.append({
-                action: 'evaluate_issue',
-                repo: `${forge.owner}/${forge.repo}`,
-                target: issue.url,
-                input: issue.bodyHash,
-                output: JSON.stringify(evaluation),
-                decision: evaluation.merit ? 'approved' : 'rejected',
-                llmCallCount: 1,
-                details: evaluation.reasoning.substring(0, 200),
-            });
-
-            if (!evaluation.merit) {
-                // Safety net: low-confidence rejections get flipped to approved
-                if (evaluation.confidence < 0.7) {
-                    this.logger.warn(
-                        `Overriding low-confidence rejection for #${issue.issueNumber} ` +
-                        `(confidence: ${evaluation.confidence.toFixed(2)}) — accepting for investigation`,
-                    );
-                    evaluation.merit = true;
-                    evaluation.reasoning = `[Auto-accepted: low confidence rejection overridden] ${evaluation.reasoning}`;
-                    evaluation.suggestedLabels = [...(evaluation.suggestedLabels || []), 'argus:low-confidence-override'];
-                } else {
-                    issue.state = 'rejected';
-                    this.addActivity(issue.repo, issue.issueNumber, undefined, '❌', `Rejected issue #${issue.issueNumber}: ${evaluation.reasoning.substring(0, 100)}`);
-                    return issue;
-                }
-            }
-
-            issue.state = 'approved';
-            this.addActivity(issue.repo, issue.issueNumber, undefined, '✅', `Approved issue #${issue.issueNumber} (${evaluation.category}/${evaluation.severity})`);
-
-            // ── Step 2: Create branch ──
-            issue.state = 'branching';
-            const defaultBranch = await forge.getDefaultBranch();
-            const branchName = `${this.config.branchPrefix}issue-${issue.issueNumber}`;
-            issue.branchName = branchName;
-
-            if (!this.config.dryRun) {
-                await forge.createBranch(defaultBranch, branchName);
-            }
-            this.addActivity(issue.repo, issue.issueNumber, undefined, '🌿', `Created branch ${branchName}`);
-
-            // ── Step 3: Investigate ──
-            this.logger.info(`Investigating codebase for issue #${issue.issueNumber}`);
-            const investigation = await this.investigator.investigate(forge, evaluation, defaultBranch);
-
-            // ── Step 4: Code ──
-            issue.state = 'coding';
-            this.addActivity(issue.repo, issue.issueNumber, undefined, '🔧', `Coding solution for issue #${issue.issueNumber}`);
-
-            // Check for edits before coding
-            const editCheck = await this.editDetector.check(forge, issue);
-            if (editCheck.detected && editCheck.action === 'halt') {
-                issue.state = 'flagged';
-                issue.error = editCheck.reason;
-                this.addActivity(issue.repo, issue.issueNumber, undefined, '🚨', `HALTED: ${editCheck.reason}`);
-                return issue;
-            }
-
-            const iterations = this.config.dryRun ? [] : await this.coder.code(forge, issue, evaluation, investigation);
-
-            // ── Step 5: Create PR ──
-            const lastIteration = iterations[iterations.length - 1];
-            const ciPassed = lastIteration?.ciResult === 'passing';
-
-            if (!this.config.dryRun && iterations.length > 0) {
-                issue.state = 'pr-open';
-                const prTitle = `${evaluation.category}: ${issue.title} (fixes #${issue.issueNumber})`;
-                const prBody = await this.buildPRBody(issue, evaluation, iterations);
-
-                const pr = await forge.createPullRequest(
-                    branchName,
-                    defaultBranch,
-                    prTitle,
-                    prBody,
-                );
-
-                issue.prNumber = pr.number;
-                issue.prUrl = pr.url;
-
-                // Post transcription comments
-                await this.transcriber.postEvaluation(forge, pr.number, issue, evaluation);
-                await this.transcriber.postInvestigation(forge, pr.number, investigation);
-                for (const it of iterations) {
-                    await this.transcriber.postIteration(forge, pr.number, it);
-                }
-                await this.transcriber.postSummary(forge, pr.number, issue, iterations);
-
-                await this.auditLog.append({
-                    action: 'create_pr',
-                    repo: `${forge.owner}/${forge.repo}`,
-                    target: pr.url,
-                    input: issue.bodyHash,
-                    output: prBody,
-                    decision: `PR #${pr.number} created`,
-                    llmCallCount: iterations.length,
-                    details: `${iterations.length} iterations, CI ${ciPassed ? 'passing' : 'not passing'}`,
-                });
-
-                this.addActivity(issue.repo, issue.issueNumber, pr.number, '📤', `Opened PR #${pr.number}`, pr.url);
-
-                // ── Step 5b: Post acknowledgment on the issue ──
-                await this.postIssueAcknowledgment(forge, issue, pr.number, pr.url, evaluation);
-
-                // ── Step 6: Monitor comments on the issue ──
-                await this.processNewIssueComments(forge, issue);
-
-                // ── Step 6b: Monitor PR review comments (e.g., from Copilot, reviewers) ──
-                await this.processNewPRComments(forge, issue);
-
-                // ── Step 7: Analyze competing PRs ──
-                issue.state = 'analyzing-competing';
-                const competing = await this.prAnalyzer.analyzeCompetingPRs(forge, issue);
-                issue.competingPRs = competing;
-
-                if (competing.length > 0) {
-                    await this.transcriber.postCompetitiveAnalysis(forge, pr.number, competing);
-                    this.addActivity(issue.repo, issue.issueNumber, pr.number, '⚔️', `Analyzed ${competing.length} competing PRs`);
-
-                    // ── Step 7: Synthesize if warranted ──
-                    const ourAnalysis = competing.find((a) => a.isOurInstance);
-                    if (this.prAnalyzer.shouldSynthesize(ourAnalysis, competing.filter((c) => !c.isOurInstance))) {
-                        issue.state = 'synthesizing';
-                        const synthesisPlan = await this.prAnalyzer.planSynthesis(
-                            competing.filter((c) => !c.isOurInstance),
-                            ourAnalysis,
-                        );
-                        await this.transcriber.postSynthesisPlan(forge, pr.number, synthesisPlan);
-                        this.addActivity(issue.repo, issue.issueNumber, pr.number, '🧬', 'Planned super PR synthesis');
-                    }
-                }
-            }
-
-            issue.state = 'done';
-            issue.completedAt = new Date();
-            this.addActivity(issue.repo, issue.issueNumber, issue.prNumber, '✔️', `Completed issue #${issue.issueNumber}`);
-
+            openPRs = await this.forge.listOpenPRs();
         } catch (err) {
-            issue.state = 'stuck';
-            issue.error = String(err);
-            this.logger.error(`Pipeline failed for issue #${issue.issueNumber}: ${err}`);
-            this.addActivity(issue.repo, issue.issueNumber, undefined, '💥', `Error: ${String(err).substring(0, 100)}`);
-        } finally {
-            this.sessions.delete(sessionKey);
+            this.log.error(`${this.key}: could not list open PRs: ${err}`);
+            return;
         }
 
-        return issue;
-    }
-
-    // ─── State Access ───────────────────────────────────────────────
-
-    getWorkQueue(): readonly TrackedIssue[] {
-        return this.workQueue;
-    }
-
-    getActivity(limit: number = 50): readonly ActivityEntry[] {
-        return this.activity.slice(-limit);
-    }
-
-    getIssuesByState(state: IssueState): TrackedIssue[] {
-        return this.workQueue.filter((i) => i.state === state);
-    }
-
-    // ─── Private Helpers ────────────────────────────────────────────
-
-    private isAlreadyTracked(issue: Issue): boolean {
-        return this.workQueue.some(
-            (t) => t.issueNumber === issue.number && t.repo === issue.repo
-        );
-    }
-
-    /**
-     * Detect work-in-progress PRs that should not be engaged yet.
-     *
-     * Checks:
-     *  1. GitHub/GitLab "draft" flag (mapped from the API).
-     *  2. Title prefixes: `[WIP]`, `WIP:`, `Draft:`, `[Draft]`.
-     *  3. Construction emoji 🚧 in title.
-     */
-    private isWorkInProgress(pr: PullRequest): boolean {
-        if (pr.draft) { return true; }
-
-        const title = pr.title.trim();
-        const upper = title.toUpperCase();
-        if (
-            upper.startsWith('[WIP]') ||
-            upper.startsWith('WIP:') ||
-            upper.startsWith('WIP ') ||
-            upper.startsWith('DRAFT:') ||
-            upper.startsWith('[DRAFT]') ||
-            title.includes('🚧')
-        ) {
-            return true;
-        }
-
-        return false;
-    }
-
-    private addActivity(
-        repo: RepoKey,
-        issueNumber: number | undefined,
-        prNumber: number | undefined,
-        icon: string,
-        message: string,
-        url?: string,
-    ): void {
-        this.activity.push({
-            timestamp: new Date(),
-            repo,
-            issueNumber,
-            prNumber,
-            icon,
-            message,
-            url,
-        });
-
-        // Keep activity log bounded
-        if (this.activity.length > 500) {
-            this.activity = this.activity.slice(-300);
-        }
-    }
-
-    private async buildPRBody(
-        issue: TrackedIssue,
-        evaluation: any,
-        iterations: any[],
-    ): Promise<string> {
-        const lastIteration = iterations[iterations.length - 1];
-
-        const content = `## Automated Fix for #${issue.issueNumber}
-
-${evaluation.reasoning}
-
-### Approach
-${evaluation.proposedApproach}
-
-### Changes
-${iterations.flatMap((it: any) => it.filesChanged.map((f: any) => `- \`${f.path}\``)).join('\n') || '_See iteration comments_'}
-
-### CI Status
-${lastIteration?.ciResult === 'passing' ? '✅ Passing' : '⚠️ Not passing — human review recommended'}
-
----
-
-> 🤖 This PR was generated by **Argus** — an AI code issue agent.
-> It should be reviewed by a human before merging.
-> **Argus never merges PRs.**
->
-> See the comments below for full AI reasoning transcription.`;
-
-        const { stamped } = this.stampManager.stampContent(content);
-        return stamped;
-    }
-
-    // ─── Issue Comment Management ───────────────────────────────────
-
-    /**
-     * Decide whether to engage with a thread.
-     *
-     * Delegates to {@link EngagementPolicy}, which bounds how much Argus says
-     * per thread and refuses to trade comments with other agents. This replaced
-     * an earlier "does Argus have the last word?" check: that re-engaged
-     * whenever anybody else commented last, so two agents applying the same
-     * rule alternated indefinitely.
-     *
-     * Fails open — if comments cannot be read we treat the thread as fresh,
-     * since going silent on a transient API error looks like Argus is dead.
-     */
-    private async shouldEngage(forge: Forge, issueNumber: number): Promise<EngagementDecision> {
         try {
-            const comments = await forge.getIssueComments(issueNumber);
-            return this.engagementPolicy.decide(comments);
+            const gated = await this.deps.gatekeeper.assessAll(this.forge, openPRs, signal);
+            if (gated > 0) {
+                this.activity(undefined, undefined, '🛡️', `Gatekeeper assessed ${gated} PR(s)`);
+            }
         } catch (err) {
-            this.logger.debug(`Could not read comments for issue #${issueNumber}: ${err}`);
-            return {
-                engage: true,
-                reason: 'Could not read comments — treating as a fresh thread',
-                ourComments: 0,
-                budget: 0,
-            };
+            if (isAbortError(err)) { throw err; }
+            this.log.error(`${this.key}: gatekeeper error: ${err}`);
         }
-    }
 
-    /**
-     * Post a stamped acknowledgment comment on the original issue linking to the PR.
-     * This serves two purposes:
-     *  1. Tells the issue author that Argus is working on it
-     *  2. Marks the issue as processed (stamp prevents re-evaluation)
-     */
-    private async postIssueAcknowledgment(
-        forge: Forge,
-        issue: TrackedIssue,
-        prNumber: number,
-        prUrl: string,
-        evaluation: any,
-    ): Promise<void> {
-        const content = `## 🤖 Argus — Issue Acknowledged
+        // Issues whose PR closed or merged are finished.
+        const openNumbers = new Set(openPRs.map((p) => p.number));
+        for (const tracked of this.state.queue) {
+            if (tracked.state === 'pr-open' && tracked.prNumber && !openNumbers.has(tracked.prNumber)) {
+                tracked.state = 'done';
+                tracked.completedAt = new Date();
+                this.activity(tracked.issueNumber, tracked.prNumber, '✔️', `PR #${tracked.prNumber} closed — #${tracked.issueNumber} done`);
+            }
+        }
 
-I've evaluated this issue and created a pull request with a proposed fix.
-
-| | |
-|---|---|
-| **Pull Request** | #${prNumber} |
-| **Category** | ${evaluation.category} |
-| **Severity** | ${evaluation.severity} |
-| **Confidence** | ${(evaluation.confidence * 100).toFixed(0)}% |
-
-### Proposed Approach
-${evaluation.proposedApproach}
-
-> Please review the PR for the full AI reasoning transcript and code changes.
-> Argus **never** merges PRs — a human must approve and merge.`;
-
-        const { stamped } = this.stampManager.stampContent(content);
-        await forge.addComment(issue.issueNumber, stamped);
-        this.logger.info(`Posted acknowledgment on issue #${issue.issueNumber} linking to PR #${prNumber}`);
-        this.addActivity(issue.repo, issue.issueNumber, prNumber, '💬', `Posted acknowledgment on issue #${issue.issueNumber}`);
-    }
-
-    /**
-     * Check for new comments on an issue that Argus hasn't responded to.
-     * Runs the comment handler for moderation, plus evaluates content comments
-     * for relevance (e.g., additional context, corrections, requests).
-     */
-    private async processNewIssueComments(
-        forge: Forge,
-        issue: TrackedIssue,
-    ): Promise<void> {
-        try {
-            const comments = await forge.getIssueComments(issue.issueNumber);
-
-            // Find comments that are NOT from Argus (no stamp) and came after
-            // the issue was first enqueued
-            const ourCommentDates = new Set<string>();
-            const newComments: typeof comments = [];
-
-            for (const comment of comments) {
-                if (this.stampManager.hasStamp(comment.body)) {
-                    ourCommentDates.add(comment.id);
+        // Argus only converses on its own PRs; other people's PRs get the merge gate and nothing else.
+        for (const pr of openPRs) {
+            throwIfAborted(signal);
+            if (isWorkInProgress(pr) || !this.isOwnPR(pr)) { continue; }
+            if (this.state.disengaged.includes(pr.number)) { continue; }
+            try {
+                const analysis = await this.loopDetector.analyze(this.forge, pr.number, openPRs);
+                if (!analysis.shouldEngage) {
+                    await this.postStamped('pr', pr.number, this.loopDetector.generateLoopComment(analysis));
+                    this.state.disengaged.push(pr.number);
+                    this.activity(undefined, pr.number, '🔄', `Loop detected on PR #${pr.number} — disengaged`);
+                    void this.deps.notifier.notify('anomalyDetected', this.key, {
+                        title: `Loop detected on PR #${pr.number}`,
+                        detail: analysis.reason,
+                        url: pr.url,
+                    });
                     continue;
                 }
-                // Only look at comments posted after we started processing
-                if (issue.startedAt && comment.createdAt > issue.startedAt) {
-                    newComments.push(comment);
-                }
+                await this.acknowledgeFeedback(pr, cfg);
+            } catch (err) {
+                if (isAbortError(err)) { throw err; }
+                this.log.error(`${this.key}: error checking PR #${pr.number}: ${err}`);
             }
-
-            if (newComments.length === 0) {
-                this.logger.debug(`No new comments on issue #${issue.issueNumber}`);
-                return;
-            }
-
-            this.logger.info(
-                `Processing ${newComments.length} new comment(s) on issue #${issue.issueNumber}`,
-            );
-
-            // Run moderation/threat assessment on new comments
-            const actions = await this.commentHandler.processComments(
-                forge, issue, newComments,
-            );
-
-            // Log results
-            for (const action of actions) {
-                if (action.threatClassification !== 'clean') {
-                    this.addActivity(
-                        issue.repo, issue.issueNumber, issue.prNumber,
-                        '🛡️', `Comment by @${action.author}: ${action.threatClassification}`,
-                    );
-                }
-            }
-
-            // For clean comments that might contain useful feedback,
-            // post a stamped acknowledgment
-            const cleanComments = newComments.filter((c) => {
-                const action = actions.find((a) => a.commentId === c.id);
-                return action && action.threatClassification === 'clean';
-            });
-
-            if (cleanComments.length > 0 && issue.prNumber) {
-                const commentSummary = cleanComments
-                    .map((c) => `- @${c.author}: ${c.body.substring(0, 200)}`)
-                    .join('\n');
-
-                const content = `## 💬 New Comments Noted
-
-${cleanComments.length} new comment(s) received on issue #${issue.issueNumber} after PR creation:
-
-${commentSummary}
-
-> These comments have been logged. If they require code changes, please comment on this PR with specific instructions.`;
-
-                const { stamped } = this.stampManager.stampContent(content);
-                await forge.addPRComment(issue.prNumber, stamped);
-                this.addActivity(
-                    issue.repo, issue.issueNumber, issue.prNumber,
-                    '💬', `Noted ${cleanComments.length} new comment(s) on issue`,
-                );
-            }
-        } catch (err) {
-            this.logger.error(`Failed processing comments for issue #${issue.issueNumber}: ${err}`);
         }
     }
 
     /**
-     * Check for review comments on the PR (inline code review feedback).
-     * This catches feedback from GitHub Copilot, human reviewers, and other
-     * automated tools that post review comments on the PR's diff.
-     *
-     * Anti-loop design:
-     *  - Only includes comments NEWER than `sinceDate` (last Argus stamp)
-     *  - Bot conversation comments are already filtered by the caller
-     *  - The acknowledgment includes an HTML directive `<!-- argus:ack -->`
-     *    that signals to other bots not to treat this as an action request
-     *  - Wording is purely informational — no language suggesting action
+     * Note new review feedback on one of Argus's PRs. Bounded per PR, never
+     * quotes the feedback (it may be hostile), and runs moderation on
+     * conversation comments.
      */
-    private async processNewPRComments(
-        forge: Forge,
-        issue: TrackedIssue,
-        sinceDate?: Date | null,
-    ): Promise<void> {
-        if (!issue.prNumber) { return; }
+    private async acknowledgeFeedback(pr: PullRequest, cfg: ArgusConfig): Promise<void> {
+        if (!cfg.comments.processPRComments && !cfg.comments.processPRReviews) { return; }
 
-        try {
-            // Fetch both regular PR conversation comments and inline review comments
-            const [conversationComments, reviewComments] = await Promise.all([
-                forge.getPRComments(issue.prNumber),
-                forge.getPRReviewComments(issue.prNumber),
-            ]);
-
-            // Filter out Argus's own comments (stamped) and bot conversation noise
-            let externalConversation = conversationComments.filter(
-                (c) => !this.stampManager.hasStamp(c.body) && !isBotNoise(c.author, c.body),
-            );
-            let externalReviews = reviewComments.filter(
-                (rc) => !this.stampManager.hasStamp(rc.body),
-            );
-
-            // Only include comments NEWER than our last acknowledgment
-            if (sinceDate) {
-                externalConversation = externalConversation.filter((c) => c.createdAt > sinceDate);
-                externalReviews = externalReviews.filter((rc) => rc.createdAt > sinceDate);
-            }
-
-            if (externalConversation.length === 0 && externalReviews.length === 0) {
-                this.logger.debug(`No new external comments on PR #${issue.prNumber}`);
-                return;
-            }
-
-            this.logger.info(
-                `Found ${externalConversation.length} conversation + ${externalReviews.length} review comment(s) on PR #${issue.prNumber} (new since ${sinceDate?.toISOString() ?? 'start'})`,
-            );
-
-            // Run moderation on conversation comments (they fit the Comment interface)
-            if (externalConversation.length > 0) {
-                const actions = await this.commentHandler.processComments(
-                    forge, issue, externalConversation,
-                );
-                for (const action of actions) {
-                    if (action.threatClassification !== 'clean') {
-                        this.addActivity(
-                            issue.repo, issue.issueNumber, issue.prNumber,
-                            '🛡️', `PR comment by @${action.author}: ${action.threatClassification}`,
-                        );
-                    }
-                }
-            }
-
-            // Build a summary of review comments grouped by file
-            const reviewsByFile = this.groupReviewsByFile(externalReviews);
-
-            // Build response
-            const sections: string[] = [];
-
-            if (externalConversation.length > 0) {
-                const convSnippets = externalConversation
-                    .map((c) => `- **@${c.author}**: ${c.body.substring(0, 300)}${c.body.length > 300 ? '…' : ''}`)
-                    .join('\n');
-                sections.push(`### Conversation Comments\n\n${convSnippets}`);
-            }
-
-            if (externalReviews.length > 0) {
-                const fileGroups: string[] = [];
-                for (const [filePath, comments] of reviewsByFile.entries()) {
-                    const items = comments
-                        .map((rc) => {
-                            const lineRef = rc.line ? `L${rc.line}` : 'file-level';
-                            return `  - **@${rc.author}** (${lineRef}): ${rc.body.substring(0, 250)}${rc.body.length > 250 ? '…' : ''}`;
-                        })
-                        .join('\n');
-                    fileGroups.push(`- \`${filePath}\`\n${items}`);
-                }
-                sections.push(`### Code Review Comments\n\n${fileGroups.join('\n')}`);
-            }
-
-            // Anti-loop: HTML directive tells bots this is informational only.
-            const content = `<!-- argus:ack — this is an automated log entry, not an action request -->
-## 📋 Feedback Noted
-
-${externalConversation.length + externalReviews.length} new comment(s) since last check.
-
-${sections.join('\n\n')}
-
-> Argus has recorded this feedback for the maintainer to review.
-> No automated action will be taken — a human decides whether changes are needed.`;
-
-            const { stamped } = this.stampManager.stampContent(content);
-            await forge.addPRComment(issue.prNumber, stamped);
-            this.addActivity(
-                issue.repo, issue.issueNumber, issue.prNumber,
-                '👀', `Logged ${externalReviews.length} review + ${externalConversation.length} conversation comment(s) on PR`,
-            );
-
-        } catch (err) {
-            this.logger.error(`Failed processing PR comments for PR #${issue.prNumber}: ${err}`);
-        }
-    }
-
-    /**
-     * Group review comments by file path for structured display.
-     */
-    private groupReviewsByFile(reviews: ReviewComment[]): Map<string, ReviewComment[]> {
-        const grouped = new Map<string, ReviewComment[]>();
-        for (const rc of reviews) {
-            const key = rc.path || '(unknown file)';
-            if (!grouped.has(key)) { grouped.set(key, []); }
-            grouped.get(key)!.push(rc);
-        }
-        // Sort comments within each file by line number
-        for (const [, comments] of grouped) {
-            comments.sort((a, b) => (a.line ?? 0) - (b.line ?? 0));
-        }
-        return grouped;
-    }
-
-    /**
-     * Poll all open PRs in the repo for unacknowledged comments.
-     * This runs independently of the issue pipeline — it catches review
-     * comments from GitHub Copilot, human reviewers, and other automated
-     * tools on ANY open PR, not just ones tied to a specific issue.
-     *
-     * Before checking each PR, the LoopDetector traces the full chain
-     * of related PRs.  If a chain has grown beyond the allowed depth
-     * or the same feedback is cycling, Argus posts a final "loop detected"
-     * comment and disengages.
-     *
-     * Returns the number of PRs that received new acknowledgments.
-     */
-    async pollPRComments(forge: Forge): Promise<number> {
-        const repoKey: RepoKey = `${forge.platform}:${forge.owner}/${forge.repo}`;
-        let acknowledged = 0;
-
-        try {
-            const openPRs = await forge.listOpenPRs();
-            this.logger.debug(`Checking ${openPRs.length} open PR(s) in ${repoKey} for new comments`);
-
-            // ── Gatekeeper pass ──
-            // Runs threat assessment on every open PR before comment polling.
-            // Shares the openPRs list so we don't call listOpenPRs() twice.
-            if (this.gatekeeper) {
-                try {
-                    const gated = await this.gatekeeper.assessAll(forge, openPRs);
-                    if (gated > 0) {
-                        this.addActivity(
-                            repoKey, undefined, undefined,
-                            '🛡️', `Gatekeeper assessed ${gated} PR(s) in ${repoKey}`,
-                        );
-                    }
-                } catch (err) {
-                    this.logger.error(`Gatekeeper error for ${repoKey}: ${err}`);
-                }
-            }
-
-            for (const pr of openPRs) {
-                try {
-                    // ── Skip work-in-progress PRs ──
-                    if (this.isWorkInProgress(pr)) {
-                        this.logger.debug(
-                            `PR #${pr.number}: work in progress — skipping`,
-                        );
-                        continue;
-                    }
-
-                    // ── Chain analysis ──
-                    const loopKey = `${repoKey}:${pr.number}`;
-
-                    // Already disengaged from this PR chain
-                    if (this.loopDisengaged.has(loopKey)) {
-                        this.logger.debug(`PR #${pr.number}: loop previously detected — skipping`);
-                        continue;
-                    }
-
-                    const analysis = await this.loopDetector.analyze(
-                        forge, pr.number, openPRs,
-                    );
-
-                    if (!analysis.shouldEngage) {
-                        // Post a one-time loop-detected comment
-                        const loopComment = this.loopDetector.generateLoopComment(analysis);
-                        const { stamped } = this.stampManager.stampContent(loopComment);
-                        await forge.addPRComment(pr.number, stamped);
-
-                        this.loopDisengaged.add(loopKey);
-                        this.addActivity(
-                            repoKey, undefined, pr.number,
-                            '🔄', `Loop detected on PR #${pr.number} — chain: ${analysis.chain.map((n) => `#${n}`).join(' → ')}`,
-                        );
-                        this.logger.warn(
-                            `Disengaging from PR #${pr.number}: ${analysis.reason}`,
-                        );
-                        continue;
-                    }
-
-                    // Log chain info when depth > 0
-                    if (analysis.depth > 0) {
-                        this.logger.info(
-                            `PR #${pr.number}: chain depth ${analysis.depth}/3 ` +
-                            `(${analysis.chain.map((n) => `#${n}`).join(' → ')})`,
-                        );
-                    }
-
-                    const responded = await this.checkOnePRForComments(
-                        forge, pr.number, repoKey, analysis,
-                    );
-                    if (responded) { acknowledged++; }
-                } catch (err) {
-                    this.logger.error(`Error checking PR #${pr.number}: ${err}`);
-                }
-            }
-
-            if (acknowledged > 0) {
-                this.logger.info(`Acknowledged comments on ${acknowledged} PR(s) in ${repoKey}`);
-            }
-        } catch (err) {
-            this.logger.error(`Failed polling PR comments for ${repoKey}: ${err}`);
-        }
-
-        return acknowledged;
-    }
-
-    /**
-     * Check a single PR for unacknowledged external comments.
-     * Returns true if Argus posted a new acknowledgment.
-     *
-     * Anti-loop protections:
-     *  - Chain analysis (via LoopDetector) has already approved engagement.
-     *  - Bot noise comments ("I've opened PR #X") are filtered out.
-     *  - Inline code-review comments from bots are kept — those ARE useful.
-     *  - Only comments NEWER than Argus's last stamp are considered.
-     *  - Rate-limited to MAX_ACKS_PER_PR per ACK_WINDOW_MS as a safety net.
-     */
-    private async checkOnePRForComments(
-        forge: Forge,
-        prNumber: number,
-        repo: RepoKey,
-        chainAnalysis: ChainAnalysis,
-    ): Promise<boolean> {
-        // ── Rate limit check ──
-        const ackKey = `${repo}:${prNumber}`;
-        const ackRecord = this.ackTracker.get(ackKey);
-        if (ackRecord) {
-            const elapsed = Date.now() - ackRecord.firstAckAt.getTime();
-            if (elapsed < ACK_WINDOW_MS && ackRecord.count >= MAX_ACKS_PER_PR) {
-                this.logger.debug(
-                    `PR #${prNumber}: rate-limited (${ackRecord.count} acks in ${Math.round(elapsed / 60_000)}m) — skipping`,
-                );
-                return false;
-            }
-            // Reset window if expired
+        const ack = this.state.acks[String(pr.number)];
+        if (ack) {
+            const elapsed = Date.now() - Date.parse(ack.firstAckAt);
             if (elapsed >= ACK_WINDOW_MS) {
-                this.ackTracker.delete(ackKey);
+                delete this.state.acks[String(pr.number)];
+            } else if (ack.count >= MAX_ACKS_PER_PR) {
+                return;
             }
         }
 
-        const [conversationComments, reviewComments] = await Promise.all([
-            forge.getPRComments(prNumber),
-            forge.getPRReviewComments(prNumber),
+        const [conversation, reviews] = await Promise.all([
+            cfg.comments.processPRComments ? this.forge.getPRComments(pr.number) : Promise.resolve<Comment[]>([]),
+            cfg.comments.processPRReviews ? this.forge.getPRReviewComments(pr.number) : Promise.resolve<ReviewComment[]>([]),
         ]);
 
-        // Separate Argus's stamped comments from external comments
-        const stampedComments = conversationComments.filter(
-            (c) => this.stampManager.hasStamp(c.body),
-        );
+        const stamp = this.deps.stampManager;
+        const own = (c: { id: string; body: string }, kind: 'comment' | 'review'): boolean =>
+            stamp.isOwnAuthentic(c.body, artifactId(this.key, kind, c.id));
+        const ours = conversation.filter((c) => own(c, 'comment'));
+        const since = ours.reduce<Date | null>((latest, c) => (!latest || c.createdAt > latest ? c.createdAt : latest), null);
+        const isNew = (c: { createdAt: Date }): boolean => !since || c.createdAt > since;
 
-        // Filter external conversation: exclude bot noise (e.g. "I opened PR #X")
-        const externalConversation = conversationComments.filter(
-            (c) => !this.stampManager.hasStamp(c.body) && !isBotNoise(c.author, c.body),
-        );
-        // Inline review comments from bots (copilot reviewer) are kept
-        const externalReviews = reviewComments.filter(
-            (rc) => !this.stampManager.hasStamp(rc.body),
-        );
+        const newConversation = conversation.filter((c) =>
+            !own(c, 'comment') && !isBotNoise(c.author, c.body) && isNew(c));
+        const newReviews = reviews.filter((r) => !own(r, 'review') && isNew(r));
+        if (newConversation.length === 0 && newReviews.length === 0) { return; }
 
-        if (externalConversation.length === 0 && externalReviews.length === 0) {
-            return false;
+        const tracked = this.state.queue.find((t) => t.prNumber === pr.number);
+        if (newConversation.length > 0) {
+            await this.moderate(tracked ?? this.stubFor(pr), newConversation);
         }
 
-        // Find the timestamp of Argus's latest stamped comment
-        let sinceDate: Date | null = null;
-        if (stampedComments.length > 0) {
-            const latestStamped = stampedComments.reduce((a, b) =>
-                a.createdAt > b.createdAt ? a : b,
-            );
-            sinceDate = latestStamped.createdAt;
+        const authors = [...new Set([...newConversation, ...newReviews].map((c) => c.author))];
+        const files = [...new Set(newReviews.map((r) => r.path).filter(Boolean))];
+        const content = [
+            '<!-- argus:ack — automated log entry, not an action request -->',
+            '## 📋 Feedback noted',
+            '',
+            `${newConversation.length} conversation and ${newReviews.length} review comment(s) since Argus last posted, ` +
+            `from ${authors.map(inlineCode).join(', ')}.`,
+            files.length ? `\nFiles with review comments: ${files.slice(0, 20).map(inlineCode).join(', ')}` : '',
+            '',
+            '> Argus has recorded this for the maintainer. It takes no automated action on review feedback.',
+        ].join('\n');
 
-            // Only consider comments NEWER than our last stamp
-            const newConv = externalConversation.filter((c) => c.createdAt > sinceDate!);
-            const newReviews = externalReviews.filter((rc) => rc.createdAt > sinceDate!);
+        await this.postStamped('pr', pr.number, content);
 
-            if (newConv.length === 0 && newReviews.length === 0) {
-                this.logger.debug(
-                    `PR #${prNumber}: all comments already acknowledged`,
-                );
-                return false;
+        const now = new Date().toISOString();
+        const record = this.state.acks[String(pr.number)];
+        this.state.acks[String(pr.number)] = record
+            ? { ...record, count: record.count + 1, lastAckAt: now }
+            : { count: 1, firstAckAt: now, lastAckAt: now };
+        this.activity(tracked?.issueNumber, pr.number, '👀', `Noted ${newConversation.length + newReviews.length} comment(s) on PR #${pr.number}`);
+    }
+
+    // ─── 3. Follow up on changed issues ────────────────────────────
+
+    private async followUpdatedIssues(
+        updated: { changed: Set<number> },
+        cfg: ArgusConfig,
+        signal: AbortSignal,
+    ): Promise<void> {
+        for (const tracked of this.state.queue) {
+            if (!updated.changed.has(tracked.issueNumber)) { continue; }
+            throwIfAborted(signal);
+            try {
+                if (tracked.state === 'awaiting-approval') {
+                    const issue = await this.forge.getIssue(tracked.issueNumber);
+                    if (hashBody(issue.body) !== tracked.bodyHash) {
+                        // Edited since evaluation: re-evaluate; earlier approvals no longer apply.
+                        tracked.state = 'pending';
+                        continue;
+                    }
+                    const comments = await this.forge.getIssueComments(tracked.issueNumber);
+                    const approver = await this.findApprover(issue, comments, tracked.bodySeenAt);
+                    if (approver) {
+                        tracked.approvedBy = approver;
+                        tracked.state = 'pending';
+                        this.activity(tracked.issueNumber, undefined, '🔓', `Code generation for #${tracked.issueNumber} approved by ${approver}`);
+                    }
+                } else if (tracked.state === 'pr-open' && cfg.comments.processIssueComments) {
+                    await this.moderateIssueComments(tracked);
+                }
+            } catch (err) {
+                if (isAbortError(err)) { throw err; }
+                this.log.error(`${this.key}: follow-up on #${tracked.issueNumber} failed: ${err}`);
             }
         }
+    }
 
-        // There are genuinely new, human-authored comments — respond
-        this.logger.info(
-            `PR #${prNumber}: new unacknowledged feedback detected — responding`,
-        );
+    private async moderateIssueComments(tracked: TrackedIssue): Promise<void> {
+        const cursor = this.state.commentCursor[String(tracked.issueNumber)];
+        const since = cursor ? new Date(cursor) : (tracked.startedAt ?? tracked.createdAt);
+        const now = new Date().toISOString();
+        const comments = (await this.forge.getCommentsSince(tracked.issueNumber, since))
+            .filter((c) => !this.deps.stampManager.isOwnAuthentic(c.body, artifactId(this.key, 'comment', c.id)));
+        this.state.commentCursor[String(tracked.issueNumber)] = now;
+        if (comments.length > 0) {
+            await this.moderate(tracked, comments);
+        }
+    }
 
-        // Build a stub TrackedIssue to reuse processNewPRComments
-        const stub: TrackedIssue = {
+    private async moderate(tracked: TrackedIssue, comments: Comment[]): Promise<void> {
+        const actions = await this.deps.commentHandler.processComments(this.forge, tracked, comments);
+        for (const action of actions) {
+            if (action.needsHumanReview) {
+                this.activity(tracked.issueNumber || undefined, tracked.prNumber, '🧑‍⚖️',
+                    `Comment by ${action.author} needs human review`, tracked.prUrl ?? tracked.url);
+            }
+            if (action.threatClassification === 'clean') { continue; }
+            this.activity(tracked.issueNumber || undefined, tracked.prNumber, '🛡️',
+                `Comment by ${action.author}: ${action.threatClassification}`);
+            void this.deps.notifier.notify('threatDetected', this.key, {
+                title: `${action.threatClassification} comment by ${action.author}`,
+                detail: `Actions: ${(action.actionsTaken ?? []).join(', ') || 'none'}`,
+                url: tracked.prUrl ?? tracked.url,
+            });
+            if ((action.actionsTaken ?? []).includes('blocked')) {
+                void this.deps.notifier.notify('userBlocked', this.key, {
+                    title: `Blocked ${action.author}`,
+                    detail: 'The model confirmed the comment as hostile and auto-block is enabled.',
+                });
+            }
+        }
+    }
+
+    private stubFor(pr: PullRequest): TrackedIssue {
+        return {
             issueNumber: 0,
-            repo,
-            title: '',
-            url: '',
-            state: 'done',
-            createdAt: new Date(),
+            repo: this.key,
+            title: pr.title,
+            url: pr.url,
+            state: 'pr-open',
+            createdAt: pr.createdAt,
             bodyHash: '',
             currentIteration: 0,
             maxIterations: 0,
-            prNumber,
+            prNumber: pr.number,
+            prUrl: pr.url,
         };
+    }
 
-        await this.processNewPRComments(forge, stub, sinceDate);
+    // ─── 4. Process one issue ──────────────────────────────────────
 
-        // ── Track acknowledgment for rate limiting ──
-        const existing = this.ackTracker.get(ackKey);
-        if (existing) {
-            existing.count++;
-            existing.lastAckAt = new Date();
-        } else {
-            this.ackTracker.set(ackKey, {
-                count: 1,
-                firstAckAt: new Date(),
-                lastAckAt: new Date(),
+    private async processNext(cfg: ArgusConfig, signal: AbortSignal): Promise<TrackedIssue | undefined> {
+        const next = this.state.queue.find((t) => t.state === 'pending');
+        if (!next) { return undefined; }
+
+        const hourAgo = Date.now() - 60 * 60 * 1000;
+        const startedThisHour = this.state.issueStarts.filter((t) => Date.parse(t) > hourAgo).length;
+        if (startedThisHour >= cfg.rateLimits.issuesPerHour) {
+            this.log.debug(`${this.key}: issue budget spent (${startedThisHour}/${cfg.rateLimits.issuesPerHour} this hour)`);
+            return undefined;
+        }
+        if (!this.deps.slots.tryAcquire()) {
+            this.log.debug(`${this.key}: concurrency limit reached`);
+            return undefined;
+        }
+
+        this.state.issueStarts.push(new Date().toISOString());
+        const watchdog = linkedController([signal], cfg.watchdogTimeoutMinutes * 60_000, 'watchdog timeout');
+        try {
+            await this.processIssue(next, cfg, watchdog.controller.signal);
+        } finally {
+            watchdog.dispose();
+            this.deps.slots.release();
+            await this.deps.store.save(this.key);
+        }
+        return next;
+    }
+
+    private async processIssue(tracked: TrackedIssue, cfg: ArgusConfig, signal: AbortSignal): Promise<void> {
+        tracked.state = 'evaluating';
+        tracked.startedAt = new Date();
+        tracked.maxIterations = cfg.maxIterations;
+        tracked.error = undefined;
+
+        try {
+            const issue = await this.forge.getIssue(tracked.issueNumber);
+            if (issue.state !== 'open') {
+                return this.finish(tracked, 'skipped', '⏭️', `#${tracked.issueNumber} is closed — skipped`);
+            }
+
+            // Idempotency: an Argus PR for this issue already exists (e.g. after a crash or reinstall).
+            const existing = await this.findOwnPR(tracked.issueNumber);
+            if (existing) {
+                tracked.prNumber = existing.number;
+                tracked.prUrl = existing.url;
+                tracked.state = 'pr-open';
+                this.activity(tracked.issueNumber, existing.number, '🔗', `#${tracked.issueNumber} already has Argus PR #${existing.number}`);
+                return;
+            }
+
+            // Multi-instance sovereignty: if another Argus instance (posting from an
+            // account with write access) already claimed this issue, leave it alone.
+            const issueComments = await this.forge.getIssueComments(tracked.issueNumber);
+            const ownership = await resolveOwnership(this.forge, this.deps.stampManager, this.deps.trust,
+                issueComments.map((c) => ({
+                    body: c.body, author: c.author, authorAssociation: c.authorAssociation,
+                    id: artifactId(this.key, 'comment', c.id),
+                })));
+            if (ownership.owner === 'other') {
+                return this.finish(tracked, 'skipped', '🤝',
+                    `#${tracked.issueNumber} is being handled by another Argus instance (${ownership.author})`);
+            }
+
+            // ── Evaluate (reused if the body hasn't changed since an earlier evaluation) ──
+            const bodyHash = hashBody(issue.body);
+            let evaluation = tracked.evaluation;
+            if (!evaluation || tracked.bodyHash !== bodyHash) {
+                if (tracked.bodyHash !== bodyHash) {
+                    tracked.bodySeenAt = new Date();
+                }
+                tracked.bodyHash = bodyHash;
+                tracked.approvedBy = undefined;
+                this.activity(tracked.issueNumber, undefined, '🔍', `Evaluating #${tracked.issueNumber}`);
+                evaluation = await this.deps.evaluator.evaluate(this.forge, issue, signal);
+                tracked.evaluation = evaluation;
+                await this.auditEvaluation(tracked, evaluation);
+                await this.applyTriageLabels(tracked, evaluation, cfg);
+            }
+
+            if (evaluation.reviewRequired) {
+                return this.finish(tracked, 'flagged', '🧑‍⚖️', `#${tracked.issueNumber} needs human review: ${oneLine(evaluation.reasoning, 100)}`);
+            }
+            if (!evaluation.merit) {
+                return evaluation.confidence < REJECT_CONFIDENCE
+                    ? this.finish(tracked, 'flagged', '🧑‍⚖️', `#${tracked.issueNumber}: low-confidence rejection — needs human review`)
+                    : this.finish(tracked, 'rejected', '❌', `Rejected #${tracked.issueNumber}: ${oneLine(evaluation.reasoning, 100)}`);
+            }
+            if (['question', 'duplicate', 'invalid'].includes(evaluation.category)) {
+                return this.finish(tracked, 'done', '🏷️', `#${tracked.issueNumber} triaged as ${evaluation.category} — no code needed`);
+            }
+
+            // ── Trust gate ──
+            if (!tracked.approvedBy) {
+                tracked.approvedBy = await this.findApprover(issue, issueComments, tracked.bodySeenAt);
+            }
+            if (!tracked.approvedBy) {
+                tracked.state = 'awaiting-approval';
+                this.activity(tracked.issueNumber, undefined, '🔒',
+                    `#${tracked.issueNumber} triaged; waiting for a trusted user to comment "/argus fix"`);
+                return;
+            }
+
+            await this.buildFix(tracked, issue, evaluation, cfg, signal);
+        } catch (err) {
+            this.handleFailure(tracked, err);
+        }
+    }
+
+    /**
+     * Who, if anyone, has authorized code generation: the author if trusted,
+     * otherwise the first trusted commenter who wrote `/argus fix`.
+     * Association comes from the forge, so it can't be spoofed in comment text.
+     */
+    private async findApprover(issue: Issue, comments: Comment[], bodySeenAt?: Date): Promise<string | undefined> {
+        const trust = this.deps.trust;
+        if (await trust.isTrustedForCodeGen(this.forge, issue.author, issue.authorAssociation)) {
+            return issue.author;
+        }
+        for (const c of comments) {
+            if (!APPROVAL_COMMAND.test(c.body)) { continue; }
+            // An approval only covers the text that existed when it was given.
+            if (bodySeenAt && c.createdAt <= bodySeenAt) { continue; }
+            if (await trust.isTrustedForCodeGen(this.forge, c.author, c.authorAssociation)) {
+                return c.author;
+            }
+        }
+        return undefined;
+    }
+
+    private async buildFix(
+        tracked: TrackedIssue,
+        issue: Issue,
+        evaluation: IssueEvaluation,
+        cfg: ArgusConfig,
+        signal: AbortSignal,
+    ): Promise<void> {
+        const forge = this.forge;
+        tracked.state = 'approved';
+        this.activity(tracked.issueNumber, undefined, '✅',
+            `Working on #${tracked.issueNumber} (${evaluation.category}/${evaluation.severity}, approved by ${tracked.approvedBy})`);
+
+        // Don't spend model calls and pushes on a fix that can't be published this hour.
+        const budget = this.deps.writeBudget;
+        if (budget('pr') < 1 || budget('push') < 1 || budget('branch') < 1 || budget('comment') < 2) {
+            tracked.state = 'pending';
+            this.log.info(`${this.key}: #${tracked.issueNumber} deferred — write budget (argus.rateLimits.*) exhausted for now`);
+            return;
+        }
+
+        // ── Branch (reused if a previous attempt created it) ──
+        tracked.state = 'branching';
+        const defaultBranch = await forge.getDefaultBranch();
+        const branch = `${cfg.branchPrefix}issue-${tracked.issueNumber}`;
+        tracked.branchName = branch;
+        if (!(await forge.branchExists(branch))) {
+            await forge.createBranch(defaultBranch, branch);
+            this.activity(tracked.issueNumber, undefined, '🌿', `Created branch ${branch}`);
+        }
+
+        // ── Investigate & code ──
+        // In dry run the branch was never created, so read from the default branch.
+        throwIfAborted(signal);
+        const readBranch = (await forge.branchExists(branch)) ? branch : defaultBranch;
+        const investigation = await this.deps.investigator.investigate(forge, evaluation, readBranch, signal);
+
+        tracked.state = 'coding';
+        if (!(await this.editCheck(tracked, cfg))) { return; }
+
+        const title = this.deps.sanitizer.sanitize(issue.title).sanitized;
+        const body = this.deps.sanitizer.sanitize(issue.body).sanitized;
+        this.activity(tracked.issueNumber, undefined, '🔧', `Coding #${tracked.issueNumber}`);
+        const iterations = await this.deps.coder.code(forge, tracked, evaluation, investigation, {
+            maxIterations: cfg.maxIterations,
+            maxDiffLines: cfg.maxDiffLines,
+            signal,
+            issueTitle: title,
+            issueBody: body,
+        });
+
+        const committed = iterations.filter((it) => it.commitSha);
+        if (committed.length === 0) {
+            const reason = iterations[iterations.length - 1]?.selfReview ?? 'no changes produced';
+            this.finish(tracked, 'stuck', '🧱', `#${tracked.issueNumber}: no commit — ${oneLine(reason, 100)}`);
+            tracked.error = reason;
+            void this.deps.notifier.notify('prStuck', this.key, {
+                title: `Argus could not produce a fix for #${tracked.issueNumber}`,
+                detail: reason,
+                url: tracked.url,
+            });
+            return;
+        }
+
+        // The issue must still say what we evaluated before we publish a PR for it.
+        if (!(await this.editCheck(tracked, cfg))) { return; }
+
+        // ── PR ──
+        throwIfAborted(signal);
+        tracked.state = 'pr-open';
+        const last = iterations[iterations.length - 1];
+        const prTitle = `${evaluation.category}: ${oneLine(issue.title, 100)} (#${tracked.issueNumber})`;
+        const prBody = this.buildPRBody(tracked, evaluation, iterations);
+        const pr = await forge.createPullRequest(branch, defaultBranch, prTitle, prBody.stamped);
+        if (pr.number <= 0) {
+            // Dry run: nothing was written. Don't record a PR, so turning dry run off and
+            // reprocessing does the real thing.
+            this.finish(tracked, 'skipped', '🧪', `[DRY RUN] #${tracked.issueNumber}: would open a PR (${iterations.length} iteration(s))`);
+            tracked.error = 'Dry run — nothing was written. Reprocess to run it for real.';
+            return;
+        }
+        this.deps.stampManager.recordPosted(prBody.stamp, artifactId(this.key, 'pr', pr.number), this.key);
+        tracked.prNumber = pr.number;
+        tracked.prUrl = pr.url;
+        this.state.commentCursor[String(tracked.issueNumber)] = new Date().toISOString();
+
+        await this.deps.transcriber.postTranscript(forge, pr.number, tracked, evaluation, investigation, iterations);
+        await this.postIssueAcknowledgment(tracked, pr, evaluation);
+        await this.deps.auditLog.append({
+            action: 'create_pr',
+            repo: `${forge.owner}/${forge.repo}`,
+            target: pr.url,
+            input: tracked.bodyHash,
+            output: String(pr.number),
+            decision: `PR #${pr.number} created`,
+            llmCallCount: iterations.length,
+            details: `${iterations.length} iteration(s), CI ${last?.ciResult ?? 'unknown'}, approved by ${tracked.approvedBy}`,
+        });
+        this.activity(tracked.issueNumber, pr.number, '📤', `Opened PR #${pr.number}`, pr.url);
+        void this.deps.notifier.notify('prOpened', this.key, {
+            title: `PR #${pr.number} opened for #${tracked.issueNumber}`,
+            detail: `${oneLine(issue.title, 120)} — CI ${last?.ciResult ?? 'unknown'}`,
+            url: pr.url,
+        });
+        if (last?.ciResult === 'passing') {
+            void this.deps.notifier.notify('ciPassedFinal', this.key, {
+                title: `CI passing on PR #${pr.number}`,
+                detail: `Ready for human review.`,
+                url: pr.url,
             });
         }
 
-        this.addActivity(
-            repo, undefined, prNumber,
-            '👀', `Responded to new comments on PR #${prNumber}`,
-        );
-
-        return true;
+        // ── Competing PRs ──
+        if (cfg.prAnalysis.enabled) {
+            try {
+                tracked.state = 'analyzing-competing';
+                const competing = await this.deps.prAnalyzer.analyzeCompetingPRs(forge, tracked);
+                tracked.competingPRs = competing;
+                const others = competing.filter((c) => !c.isOurInstance);
+                if (others.length > 0) {
+                    await this.deps.transcriber.postCompetitiveAnalysis(forge, pr.number, competing);
+                    this.activity(tracked.issueNumber, pr.number, '⚔️', `Analyzed ${others.length} competing PR(s)`);
+                    const ours = competing.find((c) => c.isOurInstance);
+                    if (cfg.prAnalysis.synthesisEnabled && this.deps.prAnalyzer.shouldSynthesize(ours, others)) {
+                        tracked.state = 'synthesizing';
+                        const plan = await this.deps.prAnalyzer.planSynthesis(others, ours);
+                        await this.deps.transcriber.postSynthesisPlan(forge, pr.number, plan);
+                    }
+                }
+            } catch (err) {
+                if (isAbortError(err)) { throw err; }
+                this.log.warn(`${this.key}: competing-PR analysis failed for #${tracked.issueNumber}: ${err}`);
+            } finally {
+                tracked.state = 'pr-open';
+            }
+        }
     }
+
+    /** Returns false (and flags the issue) if the body changed since evaluation. */
+    private async editCheck(tracked: TrackedIssue, cfg: ArgusConfig): Promise<boolean> {
+        if (!vscode.workspace.getConfiguration('argus').get<boolean>('security.reEvaluateOnEdit', true)) { return true; }
+        const result = await this.deps.editDetector.check(this.forge, tracked);
+        if (!result.detected) { return true; }
+
+        this.finish(tracked, 'flagged', '🚨', `Halted #${tracked.issueNumber}: ${result.reason}`);
+        tracked.error = result.reason;
+        // Re-evaluate from scratch if someone reprocesses it.
+        tracked.evaluation = undefined;
+        tracked.approvedBy = undefined;
+        await this.safeLabel(tracked.issueNumber, cfg.labels.subversionDetected);
+        void this.deps.notifier.notify('anomalyDetected', this.key, {
+            title: `Issue #${tracked.issueNumber} changed while Argus was working`,
+            detail: result.reason,
+            url: tracked.url,
+        });
+        return false;
+    }
+
+    private async findOwnPR(issueNumber: number): Promise<PullRequest | undefined> {
+        try {
+            const prs = await this.forge.listPRsForIssue(issueNumber);
+            return prs.find((p) => p.state === 'open' && this.isOwnPR(p));
+        } catch (err) {
+            this.log.debug(`${this.key}: could not list PRs for #${issueNumber}: ${err}`);
+            return undefined;
+        }
+    }
+
+    private async applyTriageLabels(tracked: TrackedIssue, evaluation: IssueEvaluation, cfg: ArgusConfig): Promise<void> {
+        const labels: string[] = [];
+        if (evaluation.reviewRequired || (!evaluation.merit && evaluation.confidence < REJECT_CONFIDENCE)) {
+            labels.push(cfg.labels.needsReview);
+        } else {
+            labels.push(evaluation.merit ? cfg.labels.approved : cfg.labels.rejected);
+        }
+
+        // Suggested labels come from the model, so only apply ones the repo already has.
+        if (evaluation.suggestedLabels.length > 0) {
+            try {
+                const existing = new Map((await this.forge.listRepoLabels()).map((l) => [l.toLowerCase(), l]));
+                for (const s of evaluation.suggestedLabels) {
+                    const match = existing.get(s.toLowerCase());
+                    if (match) { labels.push(match); }
+                }
+            } catch (err) {
+                this.log.debug(`${this.key}: could not list labels: ${err}`);
+            }
+        }
+
+        for (const label of [...new Set(labels)].slice(0, 6)) {
+            await this.safeLabel(tracked.issueNumber, label);
+        }
+    }
+
+    private async safeLabel(issueNumber: number, label: string): Promise<void> {
+        try {
+            await this.forge.addLabel(issueNumber, label);
+        } catch (err) {
+            if (isAbortError(err)) { throw err; }
+            this.log.warn(`${this.key}: could not label #${issueNumber} "${label}": ${err}`);
+        }
+    }
+
+    private buildPRBody(tracked: TrackedIssue, evaluation: IssueEvaluation, iterations: CodingIteration[]): ReturnType<StampManager['stampContent']> {
+        const last = iterations[iterations.length - 1];
+        const files = [...new Set(iterations.flatMap((it) => it.filesChanged.map((f) => f.path)))];
+        const ci = last?.ciResult === 'passing' ? '✅ passing'
+            : last?.ciResult === 'none' ? '➖ no CI configured — test manually'
+                : '⚠️ not passing — human review required';
+
+        const content = `## Automated fix for #${tracked.issueNumber}
+
+Closes #${tracked.issueNumber}
+
+### Approach
+${neutralizeModelText(evaluation.proposedApproach, 4000)}
+
+### Files changed
+${files.map((f) => `- ${inlineCode(f)}`).join('\n') || '_none_'}
+
+### CI
+${ci}
+
+---
+
+> 🤖 Generated by **Argus** at the request of ${inlineCode(tracked.approvedBy ?? 'unknown')}.
+> A human must review this before merging. Argus never merges.
+> The full reasoning transcript is in the comments below.`;
+
+        return this.deps.stampManager.stampContent(content);
+    }
+
+    private isOwnPR(pr: PullRequest): boolean {
+        return this.deps.stampManager.isOwnAuthentic(pr.body, artifactId(this.key, 'pr', pr.number));
+    }
+
+    private async postIssueAcknowledgment(tracked: TrackedIssue, pr: PullRequest, evaluation: IssueEvaluation): Promise<void> {
+        try {
+            const comments = await this.forge.getIssueComments(tracked.issueNumber);
+            const decision = new EngagementPolicy(this.deps.stampManager, this.log).decide(comments);
+            if (!decision.engage) {
+                this.log.info(`${this.key}: not acknowledging #${tracked.issueNumber} — ${decision.reason}`);
+                return;
+            }
+        } catch (err) {
+            this.log.debug(`${this.key}: could not read comments on #${tracked.issueNumber}: ${err}`);
+            return;
+        }
+
+        const content = `## 🤖 Argus opened a pull request
+
+#${pr.number} proposes a fix (${evaluation.category}, ${evaluation.severity} severity).
+
+A maintainer will review it. Argus never merges.`;
+        await this.postStamped('issue', tracked.issueNumber, content);
+    }
+
+    /**
+     * Stamp, post, and bind the stamp to the new comment, so a verbatim copy
+     * elsewhere is recognized as a replay rather than as Argus's own.
+     */
+    private async postStamped(target: 'issue' | 'pr', number: number, content: string): Promise<void> {
+        const { stamped, stamp } = this.deps.stampManager.stampContent(content);
+        const comment = target === 'pr'
+            ? await this.forge.addPRComment(number, stamped)
+            : await this.forge.addComment(number, stamped);
+        if (comment?.id && !comment.id.startsWith('dry-run-')) {
+            this.deps.stampManager.recordPosted(stamp, artifactId(this.key, 'comment', comment.id), this.key);
+        }
+    }
+
+    private async auditEvaluation(tracked: TrackedIssue, evaluation: IssueEvaluation): Promise<void> {
+        await this.deps.auditLog.append({
+            action: 'evaluate_issue',
+            repo: `${this.forge.owner}/${this.forge.repo}`,
+            target: tracked.url,
+            input: tracked.bodyHash,
+            output: JSON.stringify({ merit: evaluation.merit, confidence: evaluation.confidence, category: evaluation.category }),
+            decision: evaluation.reviewRequired ? 'review-required' : evaluation.merit ? 'merit' : 'no-merit',
+            llmCallCount: 1,
+            details: oneLine(evaluation.reasoning, 200),
+        });
+    }
+
+    // ─── Helpers ───────────────────────────────────────────────────
+
+    private finish(tracked: TrackedIssue, state: TrackedIssue['state'], icon: string, message: string): void {
+        tracked.state = state;
+        tracked.completedAt = new Date();
+        this.activity(tracked.issueNumber, tracked.prNumber, icon, message, tracked.prUrl ?? tracked.url);
+    }
+
+    private handleFailure(tracked: TrackedIssue, err: unknown): void {
+        const message = err instanceof Error ? err.message : String(err);
+        if (err instanceof Error && err.name === 'LlmRefusalError') {
+            this.finish(tracked, 'flagged', '🧑‍⚖️', `#${tracked.issueNumber}: the model declined — needs human review`);
+            tracked.error = message;
+            return;
+        }
+        if (err instanceof Error && err.name === 'LlmUnavailableError') {
+            // Not configured / signed out: nothing was attempted, try again later.
+            tracked.state = 'pending';
+            tracked.error = message;
+            this.log.warn(`${this.key}: #${tracked.issueNumber} deferred — ${message}`);
+            return;
+        }
+        if (err instanceof Error && ['ForgeRateLimitError', 'LlmRateLimitError', 'LlmUsageLimitError'].includes(err.name)) {
+            // Budget exhausted: try again on a later cycle.
+            tracked.state = 'pending';
+            tracked.error = message;
+            this.log.warn(`${this.key}: #${tracked.issueNumber} deferred — ${message}`);
+            void this.deps.notifier.notify('rateLimitWarning', this.key, { title: 'Argus hit a rate limit', detail: message });
+            return;
+        }
+        if (isAbortError(err)) {
+            this.finish(tracked, 'stuck', '⏹️', `#${tracked.issueNumber} stopped: ${message}`);
+            tracked.error = message;
+            return;
+        }
+        this.finish(tracked, 'stuck', '💥', `#${tracked.issueNumber} failed: ${oneLine(message, 100)}`);
+        tracked.error = message;
+        this.log.error(`${this.key}: pipeline failed for #${tracked.issueNumber}: ${message}`);
+        void this.deps.notifier.notify('systemError', this.key, {
+            title: `Pipeline error on #${tracked.issueNumber}`,
+            detail: message,
+            url: tracked.url,
+        });
+    }
+
+    private activity(issueNumber: number | undefined, prNumber: number | undefined, icon: string, message: string, url?: string): void {
+        this.deps.store.addActivity({ repo: this.key, issueNumber, prNumber, icon, message, url });
+    }
+}
+
+function hashBody(body: string): string {
+    return createHash('sha256').update(body || '').digest('hex');
 }

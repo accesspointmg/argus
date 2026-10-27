@@ -21,6 +21,7 @@ import * as vscode from 'vscode';
 import type { EffortLevel, ModelInfo, ProviderId } from './types';
 import { EFFORT_LEVELS } from './types';
 import { apiKeyStorageKey, createProvider, providerNeedsKey, readAiSettings } from './service';
+import { ClaudeCodeProvider, SIGN_IN_HINT } from './providers/claude-code';
 
 interface ProviderChoice {
     id: ProviderId;
@@ -42,6 +43,13 @@ const CHOICES: ProviderChoice[] = [
         label: 'VS Code (Copilot or another extension)',
         detail: 'Uses a model VS Code already provides. No API key needed.',
         modelHint: 'gpt-4o (optional — blank uses the vendor default)',
+    },
+    {
+        id: 'claude-code',
+        label: 'Claude subscription (Claude Code)',
+        detail: 'Uses your Claude Pro/Max login via the installed Claude Code. No API key. Usage counts against your plan\'s limits.',
+        modelHint: 'opus, sonnet, haiku, or a full model id (optional)',
+        supportsEffort: true,
     },
     {
         id: 'anthropic',
@@ -116,6 +124,8 @@ export async function selectAiProvider(secrets: vscode.SecretStorage): Promise<v
     if (!picked) { return; }
 
     const choice = picked.choice;
+    if (choice.id === 'claude-code' && !(await confirmClaudeCodeSignedIn(current))) { return; }
+
     const cfg = vscode.workspace.getConfiguration('argus');
     await cfg.update('ai.provider', choice.id, vscode.ConfigurationTarget.Global);
 
@@ -163,6 +173,46 @@ export async function selectAiProvider(secrets: vscode.SecretStorage): Promise<v
     vscode.window.showInformationMessage(
         `Argus will use ${choice.label}${model ? ` · ${model}` : ''}.`,
     );
+}
+
+/**
+ * Check the Claude Code CLI is installed and signed in before switching to it.
+ * Argus never handles Claude credentials, so the fix is always "sign in to
+ * Claude Code"; settings are left untouched until that is done.
+ */
+async function confirmClaudeCodeSignedIn(settings: ReturnType<typeof readAiSettings>): Promise<boolean> {
+    try {
+        const provider = createProvider({ ...settings, provider: 'claude-code' }, '');
+        if (!(provider instanceof ClaudeCodeProvider)) { return true; }
+        const status = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'Argus: checking Claude Code sign-in…' },
+            () => provider.authStatus(true),
+        );
+        if (status.loggedIn) { return true; }
+        vscode.window.showWarningMessage(`Argus: Claude Code is not signed in. ${SIGN_IN_HINT}`);
+    } catch (err) {
+        vscode.window.showErrorMessage(`Argus: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return false;
+}
+
+/**
+ * Report whether the Claude Code CLI is installed and signed in, for the
+ * "Check Claude login" command. Never shows the account email.
+ */
+export async function checkClaudeLogin(): Promise<{ ok: boolean; message: string }> {
+    try {
+        const provider = createProvider({ ...readAiSettings(), provider: 'claude-code' }, '');
+        if (!(provider instanceof ClaudeCodeProvider)) {
+            return { ok: false, message: 'Claude Code provider unavailable.' };
+        }
+        const status = await provider.authStatus(true);
+        return status.loggedIn
+            ? { ok: true, message: `Claude Code is signed in${status.subscriptionType ? ` (${status.subscriptionType} plan)` : ''}.` }
+            : { ok: false, message: `Claude Code is not signed in. ${SIGN_IN_HINT}` };
+    } catch (err) {
+        return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    }
 }
 
 /**

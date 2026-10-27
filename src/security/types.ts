@@ -22,8 +22,13 @@ export interface ThreatAssessment {
     classification: ThreatClassification;
     confidence: number;          // 0.0 - 1.0
     threatType?: ThreatType;
+    /** Pattern names / model notes. May quote attacker text — never post it. */
     evidence: string[];
     rawInput: string;            // Preserved for audit
+    /** True only when a model call completed, passed its canary, and parsed. */
+    llmConfirmed: boolean;
+    /** The classifier could not decide (model failure) — a human should look. */
+    needsHumanReview: boolean;
 }
 
 // ─── Trust Model ────────────────────────────────────────────────────
@@ -66,18 +71,20 @@ export interface UserTrustProfile {
 export interface ThreatThresholds {
     flagThreshold: number;
     blockThreshold: number;
-    reportThreshold: number;
 }
 
 /**
- * Compute dynamic threat thresholds based on trust score.
- * Higher trust → harder to flag/block/report.
+ * Trust-adjusted thresholds. `base` comes from `argus.security.threatThreshold`
+ * / `blockThreshold`; higher trust raises both (capped at 0.99).
  */
-export function computeThresholds(trustScore: number): ThreatThresholds {
+export function computeThresholds(
+    trustScore: number,
+    base: { threat: number; block: number } = { threat: 0.5, block: 0.8 },
+): ThreatThresholds {
+    const t = Math.max(0, Math.min(1, trustScore));
     return {
-        flagThreshold: 0.5 + (trustScore * 0.3),     // 0.5 (unknown) → 0.8 (owner)
-        blockThreshold: 0.8 + (trustScore * 0.19),    // 0.8 (unknown) → 0.99 (owner)
-        reportThreshold: trustScore >= 0.75 ? Infinity : 0.95,
+        flagThreshold: Math.min(0.99, base.threat + t * 0.3),
+        blockThreshold: Math.min(0.99, base.block + t * 0.19),
     };
 }
 
@@ -90,7 +97,10 @@ export type ExecutionSurfaceCategory =
     | 'dependency'      // package.json, lockfiles, requirements.txt, Gemfile
     | 'container'       // Dockerfile, docker-compose.yml
     | 'git_config'      // .gitmodules, .gitattributes (filter drivers execute on checkout)
-    | 'script';         // *.sh, *.ps1, *.bat in build-relevant paths
+    | 'script'          // *.sh, *.ps1, *.bat anywhere; git hooks
+    | 'repo_config'     // other .github/**, CODEOWNERS, bot configs
+    | 'credentials'     // .env, keys, registry credentials
+    | 'tooling';        // editor/agent configs that run commands (.vscode/tasks.json, .envrc)
 
 /** A single file change that touches the execution surface. */
 export interface ExecutionSurfaceChange {
@@ -115,6 +125,8 @@ export interface DiffAssessment {
     commitSha: string;
     /** Number of LLM calls consumed (0 when fast-pathed). */
     llmCalls: number;
+    /** The assessment could not be completed (model error, bad output, oversized diff). */
+    unavailable?: boolean;
 }
 
 // ─── Sanitization ───────────────────────────────────────────────────
@@ -169,4 +181,8 @@ export interface AuditEntry {
     details: string;      // Human-readable summary
     previousEntryHash: string;  // Chain link
     signature: string;    // HMAC-SHA256
+    /** Signing key id (entries written before key ids existed omit it). */
+    keyId?: string;
+    /** Signature payload version: 2 signs every field; absent = legacy payload. */
+    v?: number;
 }

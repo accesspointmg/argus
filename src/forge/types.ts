@@ -26,6 +26,11 @@ export interface RepoConfig {
     owner: string;
     repo: string;
     pollIntervalMinutes: number;
+    /**
+     * Self-hosted forge host (`gitlab.example.com`, `ghe.example.com`, optionally
+     * with a path prefix like `example.com/gitlab`). Omitted = github.com / gitlab.com.
+     */
+    host?: string;
     /** Per-repo email overrides. Falls back to global Argus email if absent. */
     email?: RepoEmailConfig;
 }
@@ -56,6 +61,7 @@ export interface Issue {
 
 /** Comment on an issue or PR. */
 export interface Comment {
+    /** Opaque id; pass back unchanged to `deleteComment`. */
     id: string;
     body: string;
     author: string;
@@ -68,6 +74,7 @@ export interface Comment {
 
 /** Inline review comment on a PR (e.g., from GitHub Copilot, reviewers). */
 export interface ReviewComment {
+    /** Opaque id; pass back unchanged to `deleteComment`. */
     id: string;
     body: string;
     author: string;
@@ -108,6 +115,11 @@ export interface PullRequest {
     createdAt: Date;
     updatedAt: Date;
     repo: RepoKey;
+    /**
+     * Total changed files as reported by the forge, when known (single-PR fetch).
+     * Compare with `getPRFiles().length` to detect a truncated file list.
+     */
+    changedFiles?: number;
 }
 
 /** A file change in a PR diff. */
@@ -158,12 +170,37 @@ export type RepoRole = 'owner' | 'admin' | 'maintainer' | 'write' | 'triage' | '
 /** User interaction history within a repo. */
 export interface UserHistory {
     mergedPRs: number;
+    /** Issues by this user closed as completed. */
     closedIssuesAsValid: number;
+    /** Argus-side data: forges always return 0; TrustManager overlays persisted values. */
     previousFlags: number;
+    /** Argus-side data: forges always return 0; TrustManager overlays persisted values. */
     previousBlocks: number;
+    /** Not fetched (no cheap API); always 0 from forges. */
     totalComments: number;
     accountCreatedAt?: Date;
+    /** True when some lookups failed (e.g. search rate limit) and counts are lower bounds. */
+    incomplete?: boolean;
 }
+
+/** One file in an atomic commit. `content: null` deletes the file. */
+export interface CommitFile {
+    path: string;
+    content: string | null;
+}
+
+/** Result of `validateTokenScopes`. */
+export interface TokenValidation {
+    valid: boolean;
+    warnings: string[];
+    errors: string[];
+}
+
+/**
+ * Max items any list method returns (10 pages of 100). Lists longer than this are
+ * truncated; GitHub PR files use GitHub's own 3000-file ceiling instead.
+ */
+export const MAX_LIST_ITEMS = 1000;
 
 /**
  * The Forge interface — all forge operations Argus can perform.
@@ -174,10 +211,14 @@ export interface Forge {
     readonly owner: string;
     readonly repo: string;
 
+    // List methods paginate up to MAX_LIST_ITEMS.
+
     // --- Issues ---
+    /** Open issues created or updated at/after `since` (oldest first). Excludes PRs. */
     listNewIssues(since: Date): Promise<Issue[]>;
     getIssue(issueNumber: number): Promise<Issue>;
     getIssueComments(issueNumber: number): Promise<Comment[]>;
+    /** Comments created or edited at/after `since`. */
     getCommentsSince(issueNumber: number, since: Date): Promise<Comment[]>;
     addLabel(issueNumber: number, label: string): Promise<void>;
     removeLabel(issueNumber: number, label: string): Promise<void>;
@@ -190,6 +231,10 @@ export interface Forge {
     // --- Pull Requests ---
     /** List all open PRs in the repo. */
     listOpenPRs(): Promise<PullRequest[]>;
+    /**
+     * Open PRs that reference `#N` as a whole token in title/body, or whose head
+     * branch ends in `issue-N`. Anyone can open such a PR — check the author.
+     */
     listPRsForIssue(issueNumber: number): Promise<PullRequest[]>;
     getPullRequest(prNumber: number): Promise<PullRequest>;
     getPRComments(prNumber: number): Promise<Comment[]>;
@@ -205,6 +250,9 @@ export interface Forge {
     createBranch(baseBranch: string, newBranch: string): Promise<void>;
     getFileContent(branch: string, path: string): Promise<string>;
     createOrUpdateFile(branch: string, path: string, content: string, message: string): Promise<void>;
+    /** One atomic commit on `branch`; `content: null` deletes. Returns the new head SHA. */
+    commitFiles(branch: string, files: CommitFile[], message: string): Promise<string>;
+    branchExists(branch: string): Promise<boolean>;
     /** List files/dirs at a path in the repo tree. Returns paths relative to root. */
     listTree(branch: string, path?: string, recursive?: boolean): Promise<TreeEntry[]>;
 
@@ -228,11 +276,15 @@ export interface Forge {
     getUserHistory(username: string): Promise<UserHistory>;
 
     // --- Moderation ---
+    /** Delete an issue/PR comment or review comment by the id a list method returned. */
     deleteComment(commentId: string): Promise<void>;
+    /** Throws `UnsupportedError` where no repo/org-scoped block exists (GitLab). */
     blockUser(username: string): Promise<void>;
     unblockUser(username: string): Promise<void>;
+    /** Neither forge has a report API: always throws `UnsupportedError`. */
     reportUser(username: string, reason: string): Promise<void>;
 
     // --- Token Validation ---
-    validateTokenScopes(): Promise<{ valid: boolean; warnings: string[]; errors: string[] }>;
+    /** Checks access to this repo and flags over-broad tokens. Never throws. */
+    validateTokenScopes(): Promise<TokenValidation>;
 }

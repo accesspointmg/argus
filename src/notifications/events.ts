@@ -1,77 +1,92 @@
 // Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT
 
 /**
- * Event routing — connects pipeline events to the email notification system.
+ * Event routing — turns pipeline events into emails.
+ *
+ * Event names match `argus.email.events` in settings. Each event can be
+ * switched off individually, and nothing is sent during `argus.email.quietHours`
+ * except emergency stops. Sending never throws into the pipeline.
  */
 
 import type { EmailSender } from './email';
 import type { Logger } from '../util/logger';
 import type { RepoKey } from '../forge/types';
-import type { TrackedIssue, IssueEvaluation, PRAnalysis, CodingIteration } from '../agent/types';
-import * as templates from './templates';
+import type { EmailEventName, EmailPolicy } from '../util/config';
+import { readConfig } from '../util/config';
+import { notificationEmail } from './templates';
 
-export type EventType =
-    | 'issue_evaluated'
-    | 'pr_created'
-    | 'threat_detected'
-    | 'competing_prs_analyzed'
-    | 'pipeline_error';
+export interface NotificationDetails {
+    title: string;
+    detail?: string;
+    url?: string;
+}
+
+/** Events that ignore quiet hours. */
+const URGENT: readonly EmailEventName[] = ['emergencyStop'];
+
+/** Repeats of the same event+title inside this window are dropped. */
+const DEDUPE_MS = 30 * 60 * 1000;
 
 export class NotificationRouter {
+    private recent = new Map<string, number>();
+
     constructor(
         private readonly emailSender: EmailSender,
         private readonly logger: Logger,
+        private readonly policy: () => EmailPolicy = () => readConfig().emailPolicy,
+        private readonly now: () => Date = () => new Date(),
     ) {}
 
-    async onIssueEvaluated(issue: TrackedIssue, evaluation: IssueEvaluation, repoKey?: RepoKey): Promise<void> {
+    async notify(event: EmailEventName, repo: RepoKey | undefined, details: NotificationDetails): Promise<boolean> {
         try {
-            const msg = templates.issueEvaluated(issue, evaluation);
-            await this.emailSender.send(msg, repoKey);
-        } catch (err) {
-            this.logger.warn(`Failed to send issue evaluation email: ${err}`);
-        }
-    }
+            const policy = this.policy();
+            if (policy.events[event]?.enabled === false) { return false; }
+            if (!URGENT.includes(event) && policy.quietHours && inQuietHours(this.now(), policy.quietHours)) {
+                this.logger.debug(`Email for ${event} suppressed (quiet hours)`);
+                return false;
+            }
 
-    async onPRCreated(issue: TrackedIssue, iterations: CodingIteration[], repoKey?: RepoKey): Promise<void> {
-        try {
-            const msg = templates.prCreated(issue, iterations);
-            await this.emailSender.send(msg, repoKey);
-        } catch (err) {
-            this.logger.warn(`Failed to send PR created email: ${err}`);
-        }
-    }
+            const key = `${event}|${repo ?? ''}|${details.title}`;
+            const last = this.recent.get(key);
+            const nowMs = this.now().getTime();
+            if (last && nowMs - last < DEDUPE_MS) { return false; }
+            this.recent.set(key, nowMs);
+            if (this.recent.size > 500) {
+                for (const [k, t] of this.recent) {
+                    if (nowMs - t > DEDUPE_MS) { this.recent.delete(k); }
+                }
+            }
 
-    async onThreatDetected(
-        repo: string,
-        username: string,
-        classification: string,
-        confidence: number,
-        actions: string[],
-        repoKey?: RepoKey,
-    ): Promise<void> {
-        try {
-            const msg = templates.threatDetected(repo, username, classification, confidence, actions);
-            await this.emailSender.send(msg, repoKey);
+            return await this.emailSender.send(notificationEmail(event, repo, details), repo);
         } catch (err) {
-            this.logger.warn(`Failed to send threat detection email: ${err}`);
+            this.logger.warn(`Failed to send ${event} email: ${err}`);
+            return false;
         }
     }
+}
 
-    async onCompetingPRsAnalyzed(issue: TrackedIssue, analyses: PRAnalysis[], repoKey?: RepoKey): Promise<void> {
-        try {
-            const msg = templates.competingPRsAnalyzed(issue, analyses);
-            await this.emailSender.send(msg, repoKey);
-        } catch (err) {
-            this.logger.warn(`Failed to send competing PR email: ${err}`);
-        }
+/**
+ * Whether `now` falls in the quiet window. Handles windows that cross
+ * midnight (23:00–07:00). An unknown timezone falls back to UTC.
+ */
+export function inQuietHours(now: Date, quiet: { start: string; end: string; timezone: string }): boolean {
+    const minutes = (hhmm: string): number => {
+        const [h, m] = hhmm.split(':').map(Number);
+        return h * 60 + m;
+    };
+    let local: number;
+    try {
+        const parts = new Intl.DateTimeFormat('en-GB', {
+            timeZone: quiet.timezone || 'UTC', hour: '2-digit', minute: '2-digit', hour12: false,
+        }).formatToParts(now);
+        const h = Number(parts.find((p) => p.type === 'hour')?.value ?? 0) % 24;
+        const m = Number(parts.find((p) => p.type === 'minute')?.value ?? 0);
+        local = h * 60 + m;
+    } catch {
+        local = now.getUTCHours() * 60 + now.getUTCMinutes();
     }
-
-    async onPipelineError(issueNumber: number, repo: string, error: string, repoKey?: RepoKey): Promise<void> {
-        try {
-            const msg = templates.pipelineError(issueNumber, repo, error);
-            await this.emailSender.send(msg, repoKey);
-        } catch (err) {
-            this.logger.warn(`Failed to send pipeline error email: ${err}`);
-        }
-    }
+    const start = minutes(quiet.start);
+    const end = minutes(quiet.end);
+    if (start === end) { return false; }
+    return start < end ? local >= start && local < end : local >= start || local < end;
 }

@@ -16,7 +16,8 @@
  *   Refusals fall back to another model. Argus deliberately feeds Claude
  *   attacker-supplied text, and the cyber safeguards on the current models
  *   sometimes decline it. `fallbacks: 'default'` re-runs a declined request
- *   server-side on Anthropic's recommended substitute, so a false positive on a
+ *   server-side on Anthropic's recommended substitute (models that reject the
+ *   beta are retried without it), so a false positive on a
  *   genuine security review costs a little latency instead of the whole
  *   assessment. A refusal that survives the fallback is surfaced as
  *   {@link LlmRefusalError} — callers with a conservative default should use it.
@@ -40,13 +41,25 @@ export const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5';
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 
 /**
- * Models known to support the server-side fallback beta.
- * Others get the request without `fallbacks` / `betas` so they don't 400.
+ * Endpoint+model pairs that rejected the fallback beta with a 400.
+ *
+ * Rather than hard-coding which models support it (a list that goes stale
+ * with every release), every model is tried with fallbacks once; a 400 that
+ * names the parameter is retried without and remembered for the session.
  */
-const FALLBACK_ELIGIBLE_MODELS = new Set([
-    'claude-opus-5',
-    'claude-sonnet-4-20250514',
-]);
+const fallbackUnsupported = new Set<string>();
+
+/** A 400 caused by the fallback parameter or its beta header, not by the request itself. */
+export function isFallbackRejection(err: unknown): boolean {
+    return err instanceof Anthropic.BadRequestError && /fallback/i.test(err.message);
+}
+
+/** The parts of a (beta or GA) Message this provider reads. */
+interface ReplyShape {
+    stop_reason: string | null;
+    stop_details?: { type?: string; category?: string | null } | null;
+    content: Array<{ type: string; text?: string }>;
+}
 
 export interface AnthropicOptions {
     apiKey: string;
@@ -101,8 +114,27 @@ export class AnthropicProvider implements LlmProvider {
     }
 
     async chat(request: ChatRequest): Promise<string> {
-        const useFallback = FALLBACK_ELIGIBLE_MODELS.has(this.model);
+        const cacheKey = JSON.stringify([this.options.baseUrl ?? '', this.model]);
+        const controller = new AbortController();
+        const subscription = request.token?.onCancellationRequested(() => controller.abort());
+        if (request.token?.isCancellationRequested) { controller.abort(); }
 
+        try {
+            if (!fallbackUnsupported.has(cacheKey)) {
+                try {
+                    return await this.send(request, true, controller.signal);
+                } catch (err) {
+                    if (!isFallbackRejection(err)) { throw err; }
+                    fallbackUnsupported.add(cacheKey);
+                }
+            }
+            return await this.send(request, false, controller.signal);
+        } finally {
+            subscription?.dispose();
+        }
+    }
+
+    private async send(request: ChatRequest, useFallback: boolean, signal: AbortSignal): Promise<string> {
         const params: Record<string, unknown> = {
             model: this.model,
             max_tokens: request.maxTokens ?? this.options.defaultMaxTokens,
@@ -113,18 +145,21 @@ export class AnthropicProvider implements LlmProvider {
             ...(useFallback ? { betas: [FALLBACK_BETA], fallbacks: 'default' } : {}),
         };
 
-        // Use beta stream when fallback is enabled, regular stream otherwise.
+        // Built untyped because the beta and GA param types differ only in the
+        // fields added above; the reply is narrowed to what is read below.
+        type StreamParams = Parameters<Anthropic['messages']['stream']>[0];
+        type BetaStreamParams = Parameters<Anthropic['beta']['messages']['stream']>[0];
         const stream = useFallback
-            ? this.client.beta.messages.stream(params as any)
-            : this.client.messages.stream(params as any);
+            ? this.client.beta.messages.stream(params as unknown as BetaStreamParams, { signal })
+            : this.client.messages.stream(params as unknown as StreamParams, { signal });
 
-        const message = await stream.finalMessage();
+        const message = (await stream.finalMessage()) as unknown as ReplyShape;
 
         // Check before reading content: on a refusal the content array is empty
         // or holds a partial, and treating either as a real answer would let a
         // declined request read as "nothing suspicious found".
         if (message.stop_reason === 'refusal') {
-            const details = (message as any).stop_details;
+            const details = message.stop_details;
             const category = details?.type === 'refusal' ? details.category ?? undefined : undefined;
             throw new LlmRefusalError(
                 `${this.model} declined the request` +
@@ -136,9 +171,15 @@ export class AnthropicProvider implements LlmProvider {
 
         // Thinking blocks are dropped — callers want the answer, and on current
         // models the raw reasoning is not returned anyway.
-        return (message.content as any[])
-            .filter((block: any) => block.type === 'text')
-            .map((block: any) => block.text)
+        const text = message.content
+            .filter((block) => block.type === 'text' && typeof block.text === 'string')
+            .map((block) => block.text)
             .join('');
+        // Same contract as the other providers: an empty reply is an error,
+        // not an empty verdict.
+        if (!text) {
+            throw new Error(`${this.label} returned no text (stop_reason: ${message.stop_reason ?? 'none'})`);
+        }
+        return text;
     }
 }

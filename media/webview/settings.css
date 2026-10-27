@@ -1,0 +1,93 @@
+/* Copyright 2026 Colin Byrne. SPDX-License-Identifier: Apache-2.0 OR MIT */
+/* Shared styles for Argus settings webviews. */
+
+[hidden] { display: none !important; }
+
+body {
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+    color: var(--vscode-foreground);
+    background: var(--vscode-editor-background);
+    padding: 20px 28px;
+    max-width: 720px;
+}
+h1 { font-size: 1.5em; font-weight: 600; margin: 0 0 4px 0; }
+.subtitle { color: var(--vscode-descriptionForeground); margin: 0 0 24px 0; font-size: 0.9em; }
+a { color: var(--vscode-textLink-foreground); }
+
+.tabs {
+    display: flex;
+    flex-wrap: wrap;
+    border-bottom: 1px solid var(--vscode-widget-border);
+    margin: 20px 0;
+}
+.tab {
+    padding: 8px 16px;
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: var(--vscode-descriptionForeground);
+    font: inherit;
+    font-weight: 500;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+}
+.tab:hover { color: var(--vscode-foreground); }
+.tab.active { color: var(--vscode-foreground); border-bottom-color: var(--vscode-focusBorder); }
+
+.section { margin: 20px 0; }
+.section-title {
+    font-size: 1.05em;
+    font-weight: 600;
+    margin-bottom: 4px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--vscode-widget-border);
+}
+.field { margin-top: 12px; }
+label { display: block; font-weight: 500; margin-bottom: 4px; }
+.help { color: var(--vscode-descriptionForeground); font-size: 0.85em; margin: 2px 0 0 0; }
+.error { color: var(--vscode-errorForeground); font-size: 0.85em; margin: 2px 0 0 0; }
+.form-error { margin-top: 16px; }
+.notice {
+    margin: 12px 0;
+    padding: 8px 12px;
+    border-left: 3px solid var(--vscode-notificationsWarningIcon-foreground, var(--vscode-focusBorder));
+    background: var(--vscode-textBlockQuote-background);
+}
+
+input[type="text"], input[type="number"], select {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    border: 1px solid var(--vscode-input-border, transparent);
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border-radius: 2px;
+    font: inherit;
+}
+input:focus, select:focus { outline: 1px solid var(--vscode-focusBorder); border-color: var(--vscode-focusBorder); }
+
+.checkbox-row { display: flex; align-items: center; gap: 8px; }
+.checkbox-row label { margin: 0; font-weight: normal; }
+.action-row { display: flex; align-items: center; gap: 8px; }
+.status { font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+
+.btn-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 28px;
+    padding-top: 16px;
+    border-top: 1px solid var(--vscode-widget-border);
+}
+button {
+    padding: 6px 16px;
+    border: none;
+    border-radius: 2px;
+    font: inherit;
+    cursor: pointer;
+}
+.btn-primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+.btn-primary:hover { background: var(--vscode-button-hoverBackground); }
+.btn-secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
+.btn-secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+.btn-inline { padding: 4px 12px; font-size: 0.9em; }

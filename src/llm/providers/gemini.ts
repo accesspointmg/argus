@@ -10,7 +10,11 @@
  */
 
 import type { ChatRequest, LlmProvider, ModelInfo, ProviderId } from '../types';
+import { LlmRefusalError } from '../types';
 import { formatContext, getJson, postJson, trimBaseUrl } from './http';
+
+/** Finish reasons meaning a safety filter stopped the reply, not a fault. */
+const SAFETY_FINISH = new Set(['SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST', 'SPII', 'RECITATION']);
 
 export const DEFAULT_GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com';
 export const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash';
@@ -111,7 +115,7 @@ export class GeminiProvider implements LlmProvider {
         // reply and a safety block look alike until you check `promptFeedback`.
         const blocked = result.promptFeedback?.blockReason;
         if (blocked) {
-            throw new Error(`${this.label} blocked the prompt (${blocked})`);
+            throw new LlmRefusalError(`${this.label} blocked the prompt (${blocked})`, blocked);
         }
 
         const text = (result.candidates?.[0]?.content?.parts ?? [])
@@ -119,6 +123,9 @@ export class GeminiProvider implements LlmProvider {
             .join('');
         if (!text) {
             const reason = result.candidates?.[0]?.finishReason;
+            if (reason && SAFETY_FINISH.has(reason)) {
+                throw new LlmRefusalError(`${this.label} withheld its reply (finishReason: ${reason})`, reason);
+            }
             throw new Error(
                 `${this.label} returned no text${reason ? ` (finishReason: ${reason})` : ''}`,
             );

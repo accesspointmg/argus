@@ -24,7 +24,7 @@
  * Beyond that, Argus posts a single "loop detected" comment and stops.
  */
 
-import type { PullRequest, Comment, Forge } from '../forge/types';
+import type { PullRequest, Forge } from '../forge/types';
 import type { StampManager } from '../crypto/stamp';
 import type { Logger } from '../util/logger';
 
@@ -356,7 +356,7 @@ export class LoopDetector {
                 // Extract key phrases: first 100 chars of each review, normalized
                 const phrases = new Set(
                     reviews
-                        .filter((r) => !this.stampManager.hasStamp(r.body))
+                        .filter((r) => !this.stampManager.isOwnAuthentic(r.body))
                         .map((r) => this.normalizeForComparison(r.body)),
                 );
                 reviewSets.set(prNum, phrases);

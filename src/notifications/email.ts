@@ -12,7 +12,8 @@ import type { Logger } from '../util/logger';
 import type { RepoKey } from '../forge/types';
 
 // nodemailer is a runtime dependency — import lazily
-let nodemailer: any;
+let nodemailer: typeof import('nodemailer') | undefined;
+type Transport = import('nodemailer').Transporter;
 
 /** SMTP connection details (shared by global and per-repo configs). */
 export interface SmtpConfig {
@@ -52,8 +53,8 @@ export interface EmailMessage {
 }
 
 export class EmailSender {
-    private globalTransporter: any;
-    private repoTransporters = new Map<RepoKey, any>();
+    private globalTransporter: Transport | null = null;
+    private repoTransporters = new Map<RepoKey, Transport>();
     private config: EmailConfig;
 
     constructor(
@@ -114,7 +115,7 @@ export class EmailSender {
 
         try {
             const info = await transporter.sendMail({
-                from: `"${this.config.fromName}" <${this.config.fromAddress}>`,
+                from: { name: this.config.fromName.replace(/[\r\n"]/g, ''), address: this.config.fromAddress },
                 to: recipients.join(', '),
                 subject: message.subject,
                 text: message.text,
@@ -129,9 +130,15 @@ export class EmailSender {
         }
     }
 
-    /** Update config at runtime (e.g., when settings change). */
-    updateConfig(config: Partial<EmailConfig>): void {
-        this.config = { ...this.config, ...config };
+    /** Replace the configuration and rebuild transports (settings or password changed). */
+    async reconfigure(config: EmailConfig): Promise<void> {
+        this.dispose();
+        this.config = config;
+        await this.initialize();
+    }
+
+    get enabled(): boolean {
+        return this.config.enabled && !!this.globalTransporter;
     }
 
     dispose(): void {
@@ -144,7 +151,7 @@ export class EmailSender {
     // ── Private ─────────────────────────────────────────────────────
 
     /** Resolve the best transporter for a repo — repo-specific first, then global. */
-    private resolveTransporter(repoKey?: RepoKey): any {
+    private resolveTransporter(repoKey?: RepoKey): Transport | null {
         if (repoKey) {
             const repoTransport = this.repoTransporters.get(repoKey);
             if (repoTransport) { return repoTransport; }
@@ -175,8 +182,8 @@ export class EmailSender {
     }
 
     /** Create and verify an SMTP transport. Returns null on failure. */
-    private async createTransporter(smtp: SmtpConfig, label: string): Promise<any> {
-        if (!smtp.host) {
+    private async createTransporter(smtp: SmtpConfig, label: string): Promise<Transport | null> {
+        if (!smtp.host || !nodemailer) {
             this.logger.debug(`No SMTP host for ${label} — transport not created`);
             return null;
         }

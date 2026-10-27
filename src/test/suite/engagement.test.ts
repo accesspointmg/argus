@@ -18,9 +18,10 @@ function fakeStamps(ourInstanceId: string) {
     return {
         instanceId: ourInstanceId,
         hasStamp: (body: string) => /\[\[stamp:[a-z0-9]+\]\]/i.test(body),
-        extractInstanceId: (body: string) => {
+        // Stands in for full HMAC verification: only our own id counts as authentic.
+        isOwnAuthentic: (body: string) => {
             const m = /\[\[stamp:([a-z0-9]+)\]\]/i.exec(body);
-            return m ? m[1] : null;
+            return m !== null && ourInstanceId.startsWith(m[1]);
         },
     } as never;
 }

@@ -32,7 +32,8 @@
     "onView:argus.recentActivity",
     "onView:argus.repoStats",
     "onView:argus.security",
-    "onView:argus.systemHealth"
+    "onView:argus.systemHealth",
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -83,7 +84,7 @@
       {
         "view": "argus.workQueue",
         "contents": "Polling for issues...\nNo items in queue yet.\n\n[$(debug-stop) Stop Argus](command:argus.stop)\n[$(error) Emergency Stop](command:argus.emergencyStop)\n\n[$(list-unordered) List Repos](command:argus.listRepos)\n[$(settings-gear) Settings](command:argus.openSettings)",
-                  "when": "argus.isRunning"
+        "when": "argus.isRunning"
       },
       {
         "view": "argus.recentActivity",
@@ -214,7 +215,7 @@
         "title": "Argus: Set GitLab Token",
         "icon": "$(key)"
       },
-            {
+      {
         "command": "argus.setSmtpPassword",
         "title": "Argus: Set SMTP Password",
         "icon": "$(key)"
@@ -223,7 +224,7 @@
         "command": "argus.clearTokens",
         "title": "Argus: Clear Token"
       },
-            {
+      {
         "command": "argus.listRepos",
         "title": "Argus: List Repositories",
         "icon": "$(list-unordered)"
@@ -232,6 +233,11 @@
         "command": "argus.openSettings",
         "title": "Argus: Settings",
         "icon": "$(settings-gear)"
+      },
+      {
+        "command": "argus.checkClaudeLogin",
+        "title": "Argus: Check Claude Code Login",
+        "icon": "$(account)"
       }
     ],
     "menus": {
@@ -283,7 +289,7 @@
           "when": "view == argus.workQueue",
           "group": "navigation"
         },
-                {
+        {
           "command": "argus.removeRepo",
           "when": "view == argus.repoStats",
           "group": "navigation"
@@ -303,10 +309,10 @@
     "configuration": {
       "title": "Argus — AI Issue Agent",
       "properties": {
-                "argus.repos": {
+        "argus.repos": {
           "type": "array",
           "default": [],
-          "markdownDescription": "Repositories to monitor. Each entry can be a URL string, shorthand (`owner/repo`), or an object with per-repo email overrides:\n```json\n[\n  \"owner/repo-a\",\n  {\n    \"repo\": \"owner/repo-b\",\n    \"email\": {\n      \"recipients\": [\"john@example.com\", \"jane@example.com\"],\n      \"smtp\": { \"host\": \"smtp.example.com\", \"user\": \"alerts@example.com\" }\n    }\n  }\n]\n```\nRepos without an `email` block inherit the global `argus.email.*` settings.",
+          "markdownDescription": "Repositories to watch. Each entry is a URL, `owner/repo`, `github:owner/repo`, `gitlab:group/repo`, or an object:\n```json\n[\n  \"owner/repo-a\",\n  { \"repo\": \"gitlab:group/project\", \"host\": \"gitlab.example.com\", \"pollIntervalMinutes\": 10,\n    \"email\": { \"recipients\": [\"team@example.com\"] } }\n]\n```",
           "items": {
             "oneOf": [
               {
@@ -315,8 +321,10 @@
               },
               {
                 "type": "object",
-                "description": "Repository with per-repo email overrides",
-                "required": ["repo"],
+                "description": "Repository with optional host, poll interval and email overrides",
+                "required": [
+                  "repo"
+                ],
                 "properties": {
                   "repo": {
                     "type": "string",
@@ -328,31 +336,52 @@
                     "properties": {
                       "recipients": {
                         "type": "array",
-                        "items": { "type": "string" },
+                        "items": {
+                          "type": "string"
+                        },
                         "description": "Email addresses to notify for this repo. Overrides argus.email.defaultRecipients."
                       },
                       "smtp": {
                         "type": "object",
                         "description": "Optional SMTP override for this repo. Missing fields inherit from argus.email.smtp.",
                         "properties": {
-                          "host": { "type": "string" },
-                          "port": { "type": "number" },
-                          "secure": { "type": "boolean" },
-                          "user": { "type": "string" }
+                          "host": {
+                            "type": "string"
+                          },
+                          "port": {
+                            "type": "number"
+                          },
+                          "secure": {
+                            "type": "boolean"
+                          },
+                          "user": {
+                            "type": "string"
+                          }
                         }
                       }
                     }
+                  },
+                  "host": {
+                    "type": "string",
+                    "description": "Server for self-hosted GitLab or GitHub Enterprise, e.g. gitlab.example.com. Tokens are stored per host."
+                  },
+                  "pollIntervalMinutes": {
+                    "type": "number",
+                    "minimum": 1,
+                    "description": "Override argus.pollIntervalMinutes for this repo."
                   }
                 }
               }
             ]
-          }
+          },
+          "scope": "application"
         },
         "argus.ai.provider": {
           "type": "string",
           "default": "vscode-lm",
           "enum": [
             "vscode-lm",
+            "claude-code",
             "anthropic",
             "openai",
             "gemini",
@@ -361,6 +390,7 @@
           ],
           "enumDescriptions": [
             "A model VS Code already provides (GitHub Copilot, or any extension that registers one). No API key needed.",
+            "Your Claude Pro/Max subscription, through the installed Claude Code (its CLI runs headlessly with your existing login). No API key; usage counts against the plan limits you share with Claude Code.",
             "Anthropic Claude, via the Anthropic API. Requires a key.",
             "OpenAI GPT models, via the OpenAI API. Requires a key.",
             "Google Gemini, via the Generative Language API. Requires a key.",
@@ -368,12 +398,14 @@
             "Any endpoint speaking the OpenAI chat-completions API (Groq, Together, OpenRouter, vLLM, LM Studio, a gateway). Set argus.ai.baseUrl."
           ],
           "markdownDescription": "Which AI Argus uses. Run **Argus: Select AI Provider** to set this up interactively, including the API key.",
+          "scope": "application",
           "order": 100
         },
         "argus.ai.model": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Model to use, e.g. `claude-opus-5`, `gpt-4o`, `gemini-2.0-flash`, `llama3.1`. Leave blank for the provider's default. For `vscode-lm` this selects the model family.",
+          "markdownDescription": "Model to use, e.g. `claude-opus-5`, `gpt-4o`, `gemini-2.0-flash`, `llama3.1`. Leave blank for the provider's default. For `vscode-lm` this selects the model family; for `claude-code` use an alias (`opus`, `sonnet`, `haiku`, `fable`) or a full model id.",
+          "scope": "application",
           "order": 101
         },
         "argus.ai.effort": {
@@ -395,82 +427,98 @@
             "Recommended for coding and agentic work. More thorough, more tokens.",
             "Deepest reasoning, highest cost. Can overthink simple tasks."
           ],
-          "markdownDescription": "How hard the model should think before answering. Honored by the **Anthropic** provider; others ignore it rather than guessing at an equivalent knob. Note `xhigh` and `max` are rejected by older models — leave this at `default` unless you know the model supports the level you pick.",
+          "markdownDescription": "How hard the model should think before answering. Honored by the **Anthropic** and **Claude subscription (Claude Code)** providers; others ignore it rather than guessing at an equivalent knob. Note `xhigh` and `max` are rejected by older models — leave this at `default` unless you know the model supports the level you pick.",
+          "scope": "application",
           "order": 103
         },
         "argus.ai.baseUrl": {
           "type": "string",
           "default": "",
           "markdownDescription": "Endpoint override. Required for `openai-compatible`; optional for `ollama` (defaults to `http://localhost:11434`), `anthropic`, `openai`, and `gemini` when routing through a proxy or gateway.",
+          "scope": "application",
           "order": 102
         },
         "argus.ai.vendor": {
           "type": "string",
           "default": "copilot",
           "markdownDescription": "Only used when `#argus.ai.provider#` is `vscode-lm`: which registered chat-model vendor to select. `copilot` is the usual value.",
+          "scope": "application",
           "order": 103
         },
         "argus.ai.maxTokens": {
           "type": "number",
           "default": 32000,
           "minimum": 1024,
-          "markdownDescription": "Ceiling on a single reply. Needs to be generous — code generation returns whole files, and a truncated reply fails to parse. Ignored by `vscode-lm`, which negotiates its own limits.",
+          "markdownDescription": "Ceiling on a single reply. Needs to be generous — code generation returns whole files, and a truncated reply fails to parse. Ignored by `vscode-lm` and `claude-code`, which negotiate their own limits.",
+          "scope": "application",
           "order": 104
+        },
+        "argus.ai.claudePath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Only used when `#argus.ai.provider#` is `claude-code`: absolute path to the Claude Code CLI executable (`claude.exe` on Windows — `.cmd`/`.bat` launchers are not supported). Leave blank to use the CLI bundled with the Claude Code extension, then `claude` on PATH, then `~/.local/bin/claude`.",
+          "scope": "application",
+          "order": 105
         },
         "argus.branchPrefix": {
           "type": "string",
           "default": "ai-fix/",
-          "description": "Prefix for branches created by Argus."
-        },
-        "argus.synthesisBranchPrefix": {
-          "type": "string",
-          "default": "ai-synthesis/",
-          "description": "Prefix for synthesis branches."
+          "description": "Prefix for branches created by Argus.",
+          "scope": "application"
         },
         "argus.maxIterations": {
           "type": "number",
           "default": 5,
-          "description": "Maximum coding iterations per issue before giving up."
+          "description": "Maximum coding iterations (commit + CI round trips) per issue.",
+          "scope": "application"
         },
         "argus.maxDiffLines": {
           "type": "number",
           "default": 500,
-          "description": "Maximum lines added in a single iteration. Exceeded → pause."
+          "description": "Largest change (added + removed lines) Argus may push in one iteration. Bigger changes are rejected before push.",
+          "scope": "application"
         },
         "argus.maxConcurrentIssues": {
           "type": "number",
           "default": 1,
-          "description": "How many issues to process simultaneously."
+          "description": "Issues processed at the same time across all repositories.",
+          "scope": "application"
         },
         "argus.dryRun": {
           "type": "boolean",
           "default": false,
-          "description": "Log all actions without executing them."
+          "description": "Never write anything to GitHub/GitLab (no comments, labels, branches, commits, PRs, statuses or moderation). Actions are logged instead. Enforced below all agent code.",
+          "scope": "application"
         },
         "argus.autoStartOnActivation": {
           "type": "boolean",
           "default": false,
-          "description": "Start polling automatically when VS Code opens."
+          "description": "Start Argus automatically when VS Code starts (requires at least one repository).",
+          "scope": "application"
         },
         "argus.labels.approved": {
           "type": "string",
           "default": "ai-triaged",
-          "description": "Label applied to approved issues."
+          "description": "Label applied to issues the evaluation found to have merit.",
+          "scope": "application"
         },
         "argus.labels.rejected": {
           "type": "string",
           "default": "ai-rejected",
-          "description": "Label applied to rejected issues."
+          "description": "Label applied to rejected issues.",
+          "scope": "application"
         },
         "argus.labels.needsReview": {
           "type": "string",
           "default": "needs-human-review",
-          "description": "Label applied when AI confidence is low."
+          "description": "Label applied when the evaluation failed or was low confidence and a human should look.",
+          "scope": "application"
         },
         "argus.labels.subversionDetected": {
           "type": "string",
           "default": "subversion-detected",
-          "description": "Label applied when prompt injection or manipulation is detected."
+          "description": "Label applied when an issue changed while Argus was working on it.",
+          "scope": "application"
         },
         "argus.trust.trustedUsers": {
           "type": "array",
@@ -478,82 +526,104 @@
           "items": {
             "type": "string"
           },
-          "description": "Usernames immune from blocking/reporting (owner tier)."
+          "description": "Usernames treated as trusted: their issues may trigger code generation, they may approve code generation with \"/argus fix\", and they are never moderated.",
+          "scope": "application"
         },
         "argus.trust.treatMaintainersAsTrusted": {
           "type": "boolean",
           "default": true,
-          "description": "Maintainers get reduced suspicion (flag only, never block/report)."
+          "description": "Maintainers get reduced suspicion (flag only, never block/report).",
+          "scope": "application"
         },
         "argus.trust.treatReviewersAsTrusted": {
           "type": "boolean",
           "default": true,
-          "description": "Reviewers get reduced suspicion."
+          "description": "Reviewers get reduced suspicion.",
+          "scope": "application"
         },
         "argus.trust.newAccountSuspicionDays": {
           "type": "number",
           "default": 30,
-          "description": "Accounts younger than this get extra suspicion."
+          "description": "Accounts younger than this get extra suspicion.",
+          "scope": "application"
         },
         "argus.trust.historyWeight": {
           "type": "number",
           "default": 1,
-          "description": "Multiplier for history-based trust modifier."
+          "description": "Multiplier for history-based trust modifier.",
+          "scope": "application"
         },
         "argus.security.threatThreshold": {
           "type": "number",
           "default": 0.5,
-          "description": "Minimum threat confidence to flag content."
+          "description": "Minimum threat confidence to flag content.",
+          "scope": "application"
         },
         "argus.security.blockThreshold": {
           "type": "number",
           "default": 0.8,
-          "description": "Minimum threat confidence to block a user."
+          "description": "Minimum threat confidence to block a user.",
+          "scope": "application"
+        },
+        "argus.security.autoBlock": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically block users whose comments the model confirms as hostile (above `#argus.security.blockThreshold#`). Off by default: a block is hard to undo and affects the whole organization. Limited by `#argus.rateLimits.blocksPerDay#`. Not supported on GitLab.",
+          "scope": "application"
         },
         "argus.security.reportOnBlock": {
           "type": "boolean",
           "default": false,
-          "description": "Also report to the platform when blocking a user."
+          "description": "Also report to the platform when blocking a user.",
+          "scope": "application"
         },
         "argus.security.deleteHostileComments": {
           "type": "boolean",
           "default": true,
-          "description": "Delete comments classified as hostile (vs. just ignoring)."
+          "description": "Delete comments the model confirms as hostile (above argus.security.threatThreshold). Pattern matches alone never delete.",
+          "scope": "application"
         },
         "argus.security.reEvaluateOnEdit": {
           "type": "boolean",
           "default": true,
-          "description": "Re-triage issues when their body is edited after approval."
+          "description": "Re-triage issues when their body is edited after approval.",
+          "scope": "application"
         },
         "argus.security.maxInputLength": {
           "type": "number",
           "default": 4000,
-          "description": "Maximum characters of untrusted input sent to LLM."
+          "description": "Maximum characters of untrusted input sent to LLM.",
+          "scope": "application"
         },
         "argus.comments.processIssueComments": {
           "type": "boolean",
           "default": true,
-          "description": "Evaluate comments on issues."
+          "description": "Evaluate comments on issues.",
+          "scope": "application"
         },
         "argus.comments.processPRComments": {
           "type": "boolean",
           "default": true,
-          "description": "Evaluate comments on pull requests."
+          "description": "Evaluate comments on pull requests.",
+          "scope": "application"
         },
         "argus.comments.processPRReviews": {
           "type": "boolean",
           "default": true,
-          "description": "Evaluate PR review comments."
+          "description": "Evaluate PR review comments.",
+          "scope": "application"
         },
         "argus.prAnalysis.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Evaluate competing PRs for the same issue."
+          "description": "Evaluate competing PRs for the same issue.",
+          "scope": "application"
         },
         "argus.prAnalysis.synthesisEnabled": {
           "type": "boolean",
           "default": true,
-          "description": "Create synthesis (super) PRs from multiple competing PRs."
+          "description": "Post a plan for combining the best parts of competing PRs. Argus never opens the combined PR itself.",
+          "scope": "application"
         },
         "argus.prAnalysis.weights": {
           "type": "object",
@@ -565,70 +635,83 @@
             "minimalInvasiveness": 0.1,
             "ciPassing": 0.1
           },
-          "description": "Weights for PR scoring dimensions."
+          "description": "Weights for PR scoring dimensions.",
+          "scope": "application"
         },
         "argus.rateLimits.commentsPerHour": {
           "type": "number",
           "default": 30,
-          "description": "Maximum comments posted per hour across all repos."
+          "description": "Maximum comments posted per hour across all repos.",
+          "scope": "application"
         },
         "argus.rateLimits.branchesPerHour": {
           "type": "number",
           "default": 10,
-          "description": "Maximum branches created per hour."
+          "description": "Maximum branches created per hour.",
+          "scope": "application"
         },
         "argus.rateLimits.prsPerHour": {
           "type": "number",
           "default": 5,
-          "description": "Maximum PRs opened per hour."
+          "description": "Maximum PRs opened per hour.",
+          "scope": "application"
         },
         "argus.rateLimits.pushesPerHour": {
           "type": "number",
           "default": 20,
-          "description": "Maximum file pushes per hour."
+          "description": "Maximum file pushes per hour.",
+          "scope": "application"
         },
         "argus.rateLimits.blocksPerDay": {
           "type": "number",
           "default": 3,
-          "description": "Maximum users blocked per day."
+          "description": "Maximum users blocked per day.",
+          "scope": "application"
         },
         "argus.rateLimits.llmCallsPerHour": {
           "type": "number",
           "default": 100,
           "minimum": 1,
-          "markdownDescription": "Maximum AI model calls per hour, across every repository. A guard rail against runaway loops — with an API key configured, a retry that fails to back off bills a card. Exhausting it marks the current issue as stuck; the next poll retries it."
+          "markdownDescription": "Maximum AI model calls per hour, across every repository. A guard rail against runaway loops — with an API key configured, a retry that fails to back off bills a card. Exhausting it marks the current issue as stuck; the next poll retries it.",
+          "scope": "application"
         },
         "argus.rateLimits.issuesPerHour": {
           "type": "number",
           "default": 10,
-          "description": "Maximum issues processed per hour per repo."
+          "description": "Maximum issues processed per hour per repo.",
+          "scope": "application"
         },
         "argus.rateLimits.queueDepth": {
           "type": "number",
           "default": 50,
-          "description": "Maximum items in the queue before pausing."
+          "description": "Maximum items in the queue before pausing.",
+          "scope": "application"
         },
         "argus.watchdogTimeoutMinutes": {
           "type": "number",
           "default": 30,
-          "description": "Maximum minutes per issue before the watchdog aborts."
+          "description": "Maximum minutes Argus may spend on one issue before it is aborted.",
+          "scope": "application"
         },
         "argus.crypto.keyRotationDays": {
           "type": "number",
           "default": 90,
-          "description": "Days before suggesting key rotation."
+          "description": "Days before suggesting key rotation.",
+          "scope": "application"
         },
         "argus.crypto.nonceRetentionDays": {
           "type": "number",
           "default": 30,
-          "description": "Days to retain nonces in the anti-replay registry."
+          "description": "Days to retain nonces in the anti-replay registry.",
+          "scope": "application"
         },
         "argus.email.enabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable email notifications."
+          "description": "Enable email notifications.",
+          "scope": "application"
         },
-                "argus.email.smtp": {
+        "argus.email.smtp": {
           "type": "object",
           "default": {},
           "markdownDescription": "Global SMTP configuration. The password is stored securely — run **Argus: Set SMTP Password** from the command palette.",
@@ -651,17 +734,20 @@
               "type": "string",
               "description": "SMTP username / email address"
             }
-          }
+          },
+          "scope": "application"
         },
         "argus.email.fromAddress": {
           "type": "string",
           "default": "",
-          "description": "The From address shown on outgoing emails."
+          "description": "The From address shown on outgoing emails.",
+          "scope": "application"
         },
         "argus.email.fromName": {
           "type": "string",
           "default": "Argus",
-          "description": "The display name shown on outgoing emails."
+          "description": "The display name shown on outgoing emails.",
+          "scope": "application"
         },
         "argus.email.defaultRecipients": {
           "type": "array",
@@ -669,7 +755,8 @@
           "items": {
             "type": "string"
           },
-          "markdownDescription": "Default email recipients when a repo has no per-repo `email.recipients` override."
+          "markdownDescription": "Default email recipients when a repo has no per-repo `email.recipients` override.",
+          "scope": "application"
         },
         "argus.email.events": {
           "type": "object",
@@ -702,12 +789,8 @@
               "enabled": true
             }
           },
-          "description": "Per-event email configuration."
-        },
-        "argus.email.digestMode": {
-          "type": "boolean",
-          "default": false,
-          "description": "Batch emails into hourly digests."
+          "description": "Per-event email configuration.",
+          "scope": "application"
         },
         "argus.email.quietHours": {
           "type": "object",
@@ -727,7 +810,8 @@
             "timezone": {
               "type": "string"
             }
-          }
+          },
+          "scope": "application"
         }
       }
     }

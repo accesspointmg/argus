@@ -59,6 +59,7 @@ export interface ChatRequest {
 
 export type ProviderId =
     | 'vscode-lm'
+    | 'claude-code'
     | 'anthropic'
     | 'openai'
     | 'openai-compatible'
@@ -67,6 +68,7 @@ export type ProviderId =
 
 export const PROVIDER_IDS: readonly ProviderId[] = [
     'vscode-lm',
+    'claude-code',
     'anthropic',
     'openai',
     'openai-compatible',
@@ -90,7 +92,7 @@ export const KEYED_PROVIDERS: readonly ProviderId[] = [
  * diff is hostile is not. Leaving this unset uses the provider's own default,
  * which is the right choice until someone has a reason to move it.
  *
- * Currently honored by the Anthropic provider. Others ignore it rather than
+ * Honored by the Anthropic and Claude Code providers. Others ignore it rather than
  * guessing at an equivalent — sending the wrong knob is a 400, not a shrug.
  */
 export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -135,6 +137,15 @@ export interface LlmProvider {
      * array as "ask the user to type it" rather than as a failure.
      */
     listModels?(): Promise<ModelInfo[]>;
+
+    /**
+     * Strings that must never appear in anything Argus publishes — e.g. the
+     * signed-in account email the Claude Code CLI injects into the model's
+     * context. Replies are already scrubbed by the provider; this lets the
+     * outbound redactor scrub them too. May be empty until the provider has
+     * checked its account (after {@link isAvailable} or a first {@link chat}).
+     */
+    sensitiveStrings?(): string[];
 }
 
 // ─── Errors ─────────────────────────────────────────────────────
@@ -176,6 +187,18 @@ export class LlmRefusalError extends Error {
     constructor(message: string, readonly category?: string) {
         super(message);
         this.name = 'LlmRefusalError';
+    }
+}
+
+/**
+ * The vendor's own usage quota is spent — e.g. a Claude subscription's rolling
+ * limit. Unlike {@link LlmRateLimitError}, this came from the provider; the
+ * message carries its explanation (often including when it resets).
+ */
+export class LlmUsageLimitError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'LlmUsageLimitError';
     }
 }
 

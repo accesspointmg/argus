@@ -48,13 +48,14 @@ export class EditDetector {
             currentIssue = await forge.getIssue(tracked.issueNumber);
         } catch (err) {
             this.logger.warn(`Failed to fetch issue #${tracked.issueNumber} for edit check: ${err}`);
+            // Fail closed: if we can't confirm the issue is unchanged, don't push.
             return {
-                detected: false,
+                detected: true,
                 issueNumber: tracked.issueNumber,
                 previousHash: tracked.bodyHash,
                 currentHash: 'UNKNOWN',
-                action: 'none',
-                reason: `Failed to fetch issue: ${err}`,
+                action: 'halt',
+                reason: `Could not confirm the issue is unchanged: ${err}`,
             };
         }
 
@@ -78,7 +79,8 @@ export class EditDetector {
         );
 
         // Determine severity based on when the edit happened
-        const editedDuringCoding = tracked.state === 'coding' || tracked.state === 'iterating';
+        // Any edit once Argus has started work invalidates the evaluation it is acting on.
+        const editedDuringCoding = ['branching', 'coding', 'iterating', 'waiting-ci', 'approved'].includes(tracked.state);
         const editedAfterPR = tracked.state === 'pr-open';
 
         let action: EditDetection['action'] = 'reevaluate';
