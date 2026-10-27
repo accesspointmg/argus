@@ -7,7 +7,7 @@ We take security seriously. If you discover a security vulnerability in Argus, p
 ### How to Report
 
 1. **Do NOT** open a public GitHub issue for security vulnerabilities
-2. Email the maintainers directly with details of the vulnerability
+2. Report it privately through GitHub: [Report a vulnerability](https://github.com/accesspointmg/argus/security/advisories/new) (Security tab → "Report a vulnerability")
 3. Include as much information as possible:
    - Description of the vulnerability
    - Steps to reproduce

@@ -27,18 +27,23 @@ Please review our [Code of Conduct](CODE_OF_CONDUCT.md) before contributing.
    ```
 3. **Add the upstream remote**:
    ```bash
-   git remote add upstream https://github.com/byrcolin/argus.git
+   git remote add upstream https://github.com/accesspointmg/argus.git
    ```
-4. **Create a branch** for your work:
+4. **Create a branch from `development`** for your work:
    ```bash
-   git checkout -b feature/your-feature-name
+   git fetch upstream
+   git checkout -b feature/your-feature-name upstream/development
    ```
+
+> **Branches:** all pull requests target `development`. `main` holds released
+> code and only accepts merges from `development`; PRs opened against `main`
+> fail the branch-policy check.
 
 ## How to Contribute
 
 ### Reporting Bugs
 
-- Check if the bug has already been reported in [Issues](https://github.com/byrcolin/argus/issues)
+- Check if the bug has already been reported in [Issues](https://github.com/accesspointmg/argus/issues)
 - If not, create a new issue using the Bug Report template
 - Provide as much detail as possible
 
@@ -96,7 +101,7 @@ npm test
 1. **Update your branch** with the latest upstream changes:
    ```bash
    git fetch upstream
-   git rebase upstream/main
+   git rebase upstream/development
    ```
 
 2. **Ensure the project compiles cleanly**:
@@ -113,7 +118,7 @@ npm test
    git commit -s -m "Your commit message"
    ```
 
-6. **Push your branch** and create a pull request:
+6. **Push your branch** and open a pull request **against `development`**:
    ```bash
    git push origin feature/your-feature-name
    ```
@@ -205,6 +210,6 @@ By contributing to Argus, you agree that your contributions will be licensed und
 
 ## Questions?
 
-Feel free to open a [Discussion](https://github.com/byrcolin/argus/discussions) or reach out to the maintainers.
+Feel free to open a [Discussion](https://github.com/accesspointmg/argus/discussions) or reach out to the maintainers.
 
 Thank you for contributing!

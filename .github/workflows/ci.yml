@@ -5,8 +5,10 @@
 # Pipeline: install → compile → lint → type check → trial package
 #
 # Runner Strategy:
-#   - macOS: Always-on Mac server (self-hosted)
-#   - Same concurrency group as o3de-pilot to prevent resource contention
+#   - Pushes and PRs from branches in this repo: always-on Mac server (self-hosted),
+#     sharing a concurrency group with o3de-pilot to prevent resource contention.
+#   - PRs from forks: GitHub-hosted runner. This repo is public, so a fork PR is
+#     arbitrary code from anyone and must never run on the self-hosted Mac.
 #
 # Mirrors the o3de-pilot CI pattern: self-hosted runners, external drive
 # artifacts, path filters for efficiency.
@@ -29,16 +31,8 @@ on:
       - '.vscodeignore'
       - 'media/**'
       - '.github/workflows/ci.yml'
+  # No path filter on PRs: branch rules require these checks, so they must always report.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'package.json'
-      - 'package-lock.json'
-      - 'tsconfig.json'
-      - '.eslintrc*'
-      - '.vscodeignore'
-      - 'media/**'
-      - '.github/workflows/ci.yml'
   workflow_dispatch:
     inputs:
       force_rebuild:
@@ -51,9 +45,10 @@ permissions:
   contents: read
   actions: read
 
-# Share concurrency group with o3de-pilot — queue, don't cancel
+# Self-hosted runs share a group with o3de-pilot — queue, don't cancel.
+# Fork PRs run on GitHub-hosted runners and don't need to queue behind them.
 concurrency:
-  group: self-hosted-builds
+  group: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && format('fork-pr-{0}', github.event.pull_request.number) || 'self-hosted-builds' }}
   cancel-in-progress: false
 
 env:
@@ -65,9 +60,14 @@ jobs:
   # ===========================================================================
   validate:
     name: "Lint & Type Check"
-    runs-on: [self-hosted, macOS]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: runner.environment == 'github-hosted'
+        with:
+          node-version: 20
 
       - name: Verify Node.js
         run: |
@@ -94,16 +94,21 @@ jobs:
   trial-package:
     name: "Trial Package"
     needs: [validate]
-    runs-on: [self-hosted, macOS]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        if: runner.environment == 'github-hosted'
+        with:
+          node-version: 20
 
       - name: Install dependencies
         run: npm ci
 
       - name: Check for existing build
         id: cache
-        if: github.event.inputs.force_rebuild != 'true'
+        if: runner.environment == 'self-hosted' && github.event.inputs.force_rebuild != 'true'
         run: |
           if [ -f "$HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix" ]; then
             echo "✅ Found existing build — skipping"
@@ -118,7 +123,7 @@ jobs:
         run: npx vsce package --no-git-tag-version -o argus-verify.vsix
 
       - name: Save to external drive
-        if: steps.cache.outputs.exists != 'true'
+        if: runner.environment == 'self-hosted' && steps.cache.outputs.exists != 'true'
         run: |
           mkdir -p "$HOME/${{ env.ARTIFACT_PATH }}"
           cp argus-verify.vsix "$HOME/${{ env.ARTIFACT_PATH }}/"
@@ -135,7 +140,7 @@ jobs:
   verify-complete:
     name: "✓ Verification Complete"
     needs: [validate, trial-package]
-    runs-on: [self-hosted, macOS]
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
     if: always()
     steps:
       - name: Summary

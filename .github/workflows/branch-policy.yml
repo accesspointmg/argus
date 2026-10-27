@@ -1,0 +1,35 @@
+# =============================================================================
+# BRANCH POLICY
+# =============================================================================
+# main only accepts pull requests from this repo's `development` branch.
+# Branch rules make this check required on main.
+#
+# Runs on a GitHub-hosted runner and never checks out PR code, so it is safe
+# for pull requests from forks.
+# =============================================================================
+
+name: Branch Policy
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  source-branch:
+    name: "Source branch is development"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check source branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [ "$HEAD_REPO" != "$BASE_REPO" ] || [ "$HEAD_REF" != "development" ]; then
+            echo "::error::main only accepts pull requests from the development branch of $BASE_REPO (got $HEAD_REPO:$HEAD_REF). Please target development instead."
+            exit 1
+          fi
+          echo "✓ $HEAD_REPO:$HEAD_REF → main"
