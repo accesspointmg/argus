@@ -1,17 +1,12 @@
 # =============================================================================
 # VERIFY WORKFLOW
 # =============================================================================
-# Triggered on ANY commit to ANY branch.
+# Triggered on pushes to any branch and on every pull request.
 # Pipeline: install → compile → lint → type check → trial package
 #
-# Runner Strategy:
-#   - Pushes and PRs from branches in this repo: always-on Mac server (self-hosted),
-#     sharing a concurrency group with o3de-pilot to prevent resource contention.
-#   - PRs from forks: GitHub-hosted runner. This repo is public, so a fork PR is
-#     arbitrary code from anyone and must never run on the self-hosted Mac.
-#
-# Mirrors the o3de-pilot CI pattern: self-hosted runners, external drive
-# artifacts, path filters for efficiency.
+# Runs on GitHub-hosted runners only. This repository is public: a pull
+# request from a fork can edit this file, so nothing here may run on a
+# self-hosted machine. (The org runner group excludes this repo as well.)
 # =============================================================================
 
 name: Verify Build
@@ -34,25 +29,13 @@ on:
   # No path filter on PRs: branch rules require these checks, so they must always report.
   pull_request:
   workflow_dispatch:
-    inputs:
-      force_rebuild:
-        description: 'Force rebuild (ignore cache)'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
-  actions: read
 
-# Self-hosted runs share a group with o3de-pilot — queue, don't cancel.
-# Fork PRs run on GitHub-hosted runners and don't need to queue behind them.
 concurrency:
-  group: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && format('fork-pr-{0}', github.event.pull_request.number) || 'self-hosted-builds' }}
-  cancel-in-progress: false
-
-env:
-  ARTIFACT_PATH: artifacts/github/${{ github.repository }}/verify/${{ github.sha }}
+  group: verify-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # ===========================================================================
@@ -60,19 +43,14 @@ jobs:
   # ===========================================================================
   validate:
     name: "Lint & Type Check"
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: runner.environment == 'github-hosted'
         with:
           node-version: 20
-
-      - name: Verify Node.js
-        run: |
-          echo "Node: $(node --version)"
-          echo "npm:  $(npm --version)"
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
@@ -94,62 +72,24 @@ jobs:
   trial-package:
     name: "Trial Package"
     needs: [validate]
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        if: runner.environment == 'github-hosted'
         with:
           node-version: 20
+          cache: npm
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Check for existing build
-        id: cache
-        if: runner.environment == 'self-hosted' && github.event.inputs.force_rebuild != 'true'
-        run: |
-          if [ -f "$HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix" ]; then
-            echo "✅ Found existing build — skipping"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "📦 No existing build found, will build fresh"
-            echo "exists=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Build .vsix
-        if: steps.cache.outputs.exists != 'true'
         run: npx vsce package --no-git-tag-version -o argus-verify.vsix
 
-      - name: Save to external drive
-        if: runner.environment == 'self-hosted' && steps.cache.outputs.exists != 'true'
-        run: |
-          mkdir -p "$HOME/${{ env.ARTIFACT_PATH }}"
-          cp argus-verify.vsix "$HOME/${{ env.ARTIFACT_PATH }}/"
-          echo "✅ Saved to: $HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix"
-          ls -lh "$HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix"
-
-      - name: Report cache hit
-        if: steps.cache.outputs.exists == 'true'
-        run: echo "✅ Build already exists for ${{ github.sha }}"
-
-  # ===========================================================================
-  # VERIFICATION COMPLETE
-  # ===========================================================================
-  verify-complete:
-    name: "✓ Verification Complete"
-    needs: [validate, trial-package]
-    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && '["ubuntu-latest"]' || '["self-hosted","macOS"]') }}
-    if: always()
-    steps:
-      - name: Summary
-        run: |
-          echo "## Argus Verify Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Lint & Type Check | ${{ needs.validate.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Trial Package | ${{ needs.trial-package.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+      - name: Upload .vsix
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: argus-verify-${{ github.sha }}
+          path: argus-verify.vsix
+          retention-days: 7
