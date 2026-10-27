@@ -56,7 +56,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/argus-artifacts/release/${{ github.run_number }}
+  ARTIFACT_PATH: artifacts/github/${{ github.repository }}/release/${{ github.run_number }}
 
 jobs:
   # ===========================================================================
@@ -130,12 +130,12 @@ jobs:
 
       - name: Setup artifact directory
         run: |
-          mkdir -p "${{ env.ARTIFACT_DIR }}"
-          echo "📁 Artifact directory: ${{ env.ARTIFACT_DIR }}"
+          mkdir -p "$HOME/${{ env.ARTIFACT_PATH }}"
+          echo "📁 Artifact directory: $HOME/${{ env.ARTIFACT_PATH }}"
 
           # Cleanup old artifacts (keep last 10 releases)
           echo "🧹 Cleaning up old local artifacts..."
-          cd /Volumes/4TBNVMEEXT/argus-artifacts/release 2>/dev/null || mkdir -p /Volumes/4TBNVMEEXT/argus-artifacts/release
+          cd $HOME/artifacts/github/${{ github.repository }}/release 2>/dev/null || mkdir -p $HOME/artifacts/github/${{ github.repository }}/release
           ls -dt */ 2>/dev/null | tail -n +11 | xargs rm -rf 2>/dev/null || true
           echo "✅ Cleanup complete"
 
@@ -262,9 +262,9 @@ jobs:
       # ── Save to external drive ──
       - name: Save to external drive
         run: |
-          mkdir -p "${{ env.ARTIFACT_DIR }}"
-          cp "${{ steps.package.outputs.vsix_name }}" "${{ env.ARTIFACT_DIR }}/"
-          echo "✅ Saved to: ${{ env.ARTIFACT_DIR }}/${{ steps.package.outputs.vsix_name }}"
+          mkdir -p "$HOME/${{ env.ARTIFACT_PATH }}"
+          cp "${{ steps.package.outputs.vsix_name }}" "$HOME/${{ env.ARTIFACT_PATH }}/"
+          echo "✅ Saved to: $HOME/${{ env.ARTIFACT_PATH }}/${{ steps.package.outputs.vsix_name }}"
 
   # ===========================================================================
   # GITHUB RELEASE
@@ -293,7 +293,7 @@ jobs:
 
       - name: Copy .vsix from external drive
         run: |
-          cp "${{ env.ARTIFACT_DIR }}/${{ needs.build.outputs.vsix_name }}" .
+          cp "$HOME/${{ env.ARTIFACT_PATH }}/${{ needs.build.outputs.vsix_name }}" .
           ls -lh "${{ needs.build.outputs.vsix_name }}"
 
       - name: Create GitHub Release
@@ -339,7 +339,7 @@ jobs:
 
       - name: Copy .vsix from external drive
         run: |
-          cp "${{ env.ARTIFACT_DIR }}/${{ needs.build.outputs.vsix_name }}" .
+          cp "$HOME/${{ env.ARTIFACT_PATH }}/${{ needs.build.outputs.vsix_name }}" .
 
       - name: Publish
         env:
@@ -375,4 +375,4 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Version: \`${{ needs.build.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "Artifacts: \`${{ env.ARTIFACT_DIR }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Artifacts: \`$HOME/${{ env.ARTIFACT_PATH }}\`" >> $GITHUB_STEP_SUMMARY

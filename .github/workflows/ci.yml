@@ -57,7 +57,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARTIFACT_DIR: /Volumes/4TBNVMEEXT/argus-artifacts/verify/${{ github.sha }}
+  ARTIFACT_PATH: artifacts/github/${{ github.repository }}/verify/${{ github.sha }}
 
 jobs:
   # ===========================================================================
@@ -105,7 +105,7 @@ jobs:
         id: cache
         if: github.event.inputs.force_rebuild != 'true'
         run: |
-          if [ -f "${{ env.ARTIFACT_DIR }}/argus-verify.vsix" ]; then
+          if [ -f "$HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix" ]; then
             echo "✅ Found existing build — skipping"
             echo "exists=true" >> $GITHUB_OUTPUT
           else
@@ -120,10 +120,10 @@ jobs:
       - name: Save to external drive
         if: steps.cache.outputs.exists != 'true'
         run: |
-          mkdir -p "${{ env.ARTIFACT_DIR }}"
-          cp argus-verify.vsix "${{ env.ARTIFACT_DIR }}/"
-          echo "✅ Saved to: ${{ env.ARTIFACT_DIR }}/argus-verify.vsix"
-          ls -lh "${{ env.ARTIFACT_DIR }}/argus-verify.vsix"
+          mkdir -p "$HOME/${{ env.ARTIFACT_PATH }}"
+          cp argus-verify.vsix "$HOME/${{ env.ARTIFACT_PATH }}/"
+          echo "✅ Saved to: $HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix"
+          ls -lh "$HOME/${{ env.ARTIFACT_PATH }}/argus-verify.vsix"
 
       - name: Report cache hit
         if: steps.cache.outputs.exists == 'true'
