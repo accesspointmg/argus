@@ -1,0 +1,8 @@
+# Changes to these paths request review from the owner.
+# Workflows, security and crypto code get explicit entries so they stay
+# covered even if the default owner changes.
+*                     @byrcolin
+/.github/             @byrcolin
+/src/security/        @byrcolin
+/src/crypto/          @byrcolin
+/src/forge/guarded.ts @byrcolin
