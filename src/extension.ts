@@ -509,7 +509,7 @@ async function buildReport(ctl: ArgusController, auditLog: AuditLog, llm: LlmSer
     const verify = await auditLog.verifyChain();
     const byState = new Map<string, number>();
     for (const q of queue) { byState.set(q.state, (byState.get(q.state) ?? 0) + 1); }
-    const row = (cells: string[]): string => `| ${cells.map((c) => c.replace(/\|/g, '\\|')).join(' | ')} |`;
+    const row = (cells: string[]): string => `| ${cells.map((c) => c.replace(/\\/g, '\\\\').replace(/\|/g, '\\|')).join(' | ')} |`;
 
     return [
         `# Argus report — ${new Date().toISOString()}`,
