@@ -21,6 +21,15 @@ updates:
       # Must not exceed engines.vscode in package.json (vsce rejects the package
       # otherwise). Raise both together, deliberately.
       - dependency-name: "@types/vscode"
+      # Must match the Node inside VS Code (20 for engines.vscode ^1.95), not the latest Node.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # typescript-eslint supports TypeScript < 6.1; take majors together with it.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # v22+ is ESM-only; the extension builds to CommonJS for VS Code 1.95's Node.
+      - dependency-name: "@octokit/rest"
+        update-types: ["version-update:semver-major"]
     groups:
       dev-dependencies:
         dependency-type: development
