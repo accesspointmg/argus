@@ -440,4 +440,11 @@ suite('Security: sanitizer', () => {
         assert.ok(!out.includes('<img'));
         assert.ok(!out.includes(']('));
     });
+
+    test('neutralizeForPost: nested tags cannot reassemble into a tag', () => {
+        for (const input of ['<scr<x>ipt>alert(1)</script>', '<<script>script>', 'a <b c', '<img src=x onerror=alert(1)//']) {
+            const out = neutralizeForPost(input);
+            assert.ok(!/<[a-z!/]/i.test(out), `${input} → ${out}`);
+        }
+    });
 });

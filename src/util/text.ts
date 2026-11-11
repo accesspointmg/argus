@@ -16,10 +16,25 @@
  *  - length is capped.
  */
 export function neutralizeModelText(text: string, maxLength = 4000): string {
-    const cleaned = String(text ?? '')
-        .replace(/<!--[\s\S]*?-->/g, '')
+    const cleaned = removeUntilStable(String(text ?? ''), /<!--[\s\S]*?-->/g)
+        // Anything left (an unclosed or reassembled opener) is shown, not interpreted.
+        .replace(/<!--/g, '&lt;!--')
         .replace(/(^|[^\w`])@(?=[A-Za-z0-9])/g, '$1@​');
     return truncate(cleaned, maxLength);
+}
+
+/**
+ * Apply a removal until the text stops changing. A single pass is not enough:
+ * removing `<!--x-->` from `<!<!--x-->-- hidden -->` reassembles a comment.
+ */
+export function removeUntilStable(text: string, pattern: RegExp): string {
+    let previous: string;
+    let current = text;
+    do {
+        previous = current;
+        current = current.replace(pattern, '');
+    } while (current !== previous);
+    return current;
 }
 
 /** Inline-code a value that may contain backticks. */

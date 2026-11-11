@@ -10,6 +10,7 @@
  */
 
 import type { SanitizationResult } from './types';
+import { removeUntilStable } from '../util/text';
 import {
     INJECTION_PATTERNS,
     INVISIBLE_CHAR_PATTERNS,
@@ -146,7 +147,8 @@ export function neutralizeForPost(text: unknown, maxLength: number = 300): strin
     let t = text;
     t = t.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '');                 // eslint-disable-line no-control-regex
     t = t.replace(/[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '');
-    t = t.replace(/<[^>]*>/g, '');                                            // HTML tags / comments
+    t = removeUntilStable(t, /<[^>]*>/g);                                     // HTML tags / comments
+    t = t.replace(/</g, '&lt;').replace(/>/g, '&gt;');                        // leftovers can't form a tag
     t = t.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');                           // images → alt text
     t = t.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');                            // links → text
     t = t.replace(/\b(https?|ftp|file|javascript|data):\/*/gi, '$1[:]//');     // defang URLs

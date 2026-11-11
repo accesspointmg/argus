@@ -109,6 +109,12 @@ suite('Text helpers', () => {
         assert.ok(out.includes('a@b.com'), 'email addresses are not mentions');
     });
 
+    test('nested HTML comments cannot reassemble into a hidden comment', () => {
+        const out = neutralizeModelText('<!<!--x-->-- hidden -->visible');
+        assert.ok(!out.includes('<!--'), out);
+        assert.ok(out.includes('visible'));
+    });
+
     test('inlineCode survives backticks and newlines', () => {
         assert.strictEqual(inlineCode('a`b'), '``a`b``');
         assert.strictEqual(inlineCode('a\nb'), '`a b`');
